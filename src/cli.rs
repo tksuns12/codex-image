@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::codex::generate_image_with_codex;
@@ -33,6 +33,41 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum OutputMode {
+    #[default]
+    Human,
+    Json,
+}
+
+#[derive(Args, Clone, Copy, Debug, Default)]
+struct OutputArgs {
+    /// Success output mode. Human-readable text by default; JSON is stable for automation.
+    #[arg(long, value_enum, default_value_t = OutputMode::Human)]
+    output: OutputMode,
+    /// Suppress success stdout output. Errors are still emitted on stderr.
+    #[arg(long, default_value_t = false)]
+    quiet: bool,
+}
+
+impl OutputArgs {
+    const fn effective_mode(self) -> OutputMode {
+        if self.quiet {
+            OutputMode::Human
+        } else {
+            self.output
+        }
+    }
+
+    const fn should_emit_stdout(self) -> bool {
+        !self.quiet
+    }
+
+    const fn is_json(self) -> bool {
+        matches!(self.effective_mode(), OutputMode::Json)
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Generate image artifacts and a manifest for the provided prompt via installed Codex.
@@ -42,6 +77,8 @@ enum Commands {
         /// Output directory where generated image files and manifest.json are written.
         #[arg(long, value_name = "DIR")]
         out: PathBuf,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Update codex-image to the latest GitHub Release archive for the current platform.
     Update {
@@ -54,6 +91,8 @@ enum Commands {
         /// Optional GitHub Release tag (for example: v1.2.3). Defaults to latest when omitted.
         #[arg(long = "version", value_name = "TAG", value_parser = parse_release_tag)]
         version: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Manage codex-image native skill installation paths.
     Skill {
@@ -79,6 +118,8 @@ enum SkillCommands {
         /// Overwrite manual or tampered existing content.
         #[arg(long, default_value_t = false)]
         force: bool,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Refresh managed codex-image SKILL.md files for selected supported tool/scope targets.
     /// No-ops current managed files and protects manual edits unless --force is passed.
@@ -96,6 +137,8 @@ enum SkillCommands {
         /// Overwrite manual or tampered existing content.
         #[arg(long, default_value_t = false)]
         force: bool,
+        #[command(flatten)]
+        output: OutputArgs,
     },
 }
 
@@ -240,17 +283,23 @@ pub fn run() -> i32 {
 
 fn dispatch(cli: Cli) -> Result<(), CliError> {
     match cli.command {
-        Commands::Generate { prompt, out } => generate(prompt, out),
+        Commands::Generate {
+            prompt,
+            out,
+            output,
+        } => generate(prompt, out, output),
         Commands::Update {
             yes,
             dry_run,
             version,
-        } => update(yes, dry_run, version),
+            output,
+        } => update(yes, dry_run, version, output),
         Commands::Skill { command } => dispatch_skill(command),
     }
 }
 
-fn generate(prompt: String, out: PathBuf) -> Result<(), CliError> {
+fn generate(prompt: String, out: PathBuf, output: OutputArgs) -> Result<(), CliError> {
+    let _ = (output.should_emit_stdout(), output.is_json());
     let generated = generate_image_with_codex(&prompt, &out)?;
     let manifest = write_generation_output_from_files(
         &prompt,
@@ -264,7 +313,13 @@ fn generate(prompt: String, out: PathBuf) -> Result<(), CliError> {
     Ok(())
 }
 
-fn update(yes: bool, dry_run: bool, version: Option<String>) -> Result<(), CliError> {
+fn update(
+    yes: bool,
+    dry_run: bool,
+    version: Option<String>,
+    output: OutputArgs,
+) -> Result<(), CliError> {
+    let _ = (output.should_emit_stdout(), output.is_json());
     let client = GitHubReleaseClient::new(UPDATE_REPOSITORY)?;
     let installer = FilesystemBinaryInstaller;
     let current_executable =
@@ -358,13 +413,15 @@ fn dispatch_skill(command: SkillCommands) -> Result<(), CliError> {
             scope,
             yes,
             force,
-        } => skill_command(SkillCommandOperation::Install, &tool, &scope, yes, force),
+            output,
+        } => skill_command(SkillCommandOperation::Install, &tool, &scope, yes, force, output),
         SkillCommands::Update {
             tool,
             scope,
             yes,
             force,
-        } => skill_command(SkillCommandOperation::Update, &tool, &scope, yes, force),
+            output,
+        } => skill_command(SkillCommandOperation::Update, &tool, &scope, yes, force, output),
     }
 }
 
@@ -374,7 +431,9 @@ fn skill_command(
     scopes: &[ScopeArg],
     yes: bool,
     force: bool,
+    output: OutputArgs,
 ) -> Result<(), CliError> {
+    let _ = (output.should_emit_stdout(), output.is_json());
     let interactive_mode = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let selector = DialoguerTargetSelector;
     skill_command_with_selector(

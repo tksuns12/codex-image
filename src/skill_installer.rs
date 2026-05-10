@@ -181,7 +181,8 @@ pub fn uninstall_skill(
 
     let status = match classification {
         SkillContentClassification::Missing => SkillUninstallStatus::AlreadyMissing,
-        SkillContentClassification::ManagedCurrent | SkillContentClassification::ManagedOutdated => {
+        SkillContentClassification::ManagedCurrent
+        | SkillContentClassification::ManagedOutdated => {
             remove_skill_file(plan.target_path())?;
             SkillUninstallStatus::Deleted
         }

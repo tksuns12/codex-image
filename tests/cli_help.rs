@@ -19,6 +19,22 @@ fn cli_help_generate_help_documents_required_out_and_prompt_contract() {
 }
 
 #[test]
+fn cli_help_output_mode_generate_help_lists_output_and_quiet_flags() {
+    let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
+    cmd.arg("generate").arg("--help");
+
+    cmd.assert()
+        .success()
+        .stdout(
+            predicate::str::contains("--output <OUTPUT>")
+                .or(predicate::str::contains("--output <output>")),
+        )
+        .stdout(predicate::str::contains("--quiet"))
+        .stdout(predicate::str::contains("human"))
+        .stdout(predicate::str::contains("json"));
+}
+
+#[test]
 fn cli_help_skill_install_help_documents_non_interactive_and_interactive_modes() {
     let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
     cmd.arg("skill").arg("install").arg("--help");
@@ -39,6 +55,22 @@ fn cli_help_skill_install_help_documents_non_interactive_and_interactive_modes()
         .stdout(predicate::str::contains("--force"))
         .stdout(predicate::str::contains("claude-code"))
         .stdout(predicate::str::contains("opencode"));
+}
+
+#[test]
+fn cli_help_output_mode_skill_install_help_lists_output_and_quiet_flags() {
+    let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
+    cmd.arg("skill").arg("install").arg("--help");
+
+    cmd.assert()
+        .success()
+        .stdout(
+            predicate::str::contains("--output <OUTPUT>")
+                .or(predicate::str::contains("--output <output>")),
+        )
+        .stdout(predicate::str::contains("--quiet"))
+        .stdout(predicate::str::contains("human"))
+        .stdout(predicate::str::contains("json"));
 }
 
 #[test]
@@ -65,6 +97,22 @@ fn cli_help_skill_update_help_documents_refresh_noop_and_manual_edit_protection(
 }
 
 #[test]
+fn cli_help_output_mode_skill_update_help_lists_output_and_quiet_flags() {
+    let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
+    cmd.arg("skill").arg("update").arg("--help");
+
+    cmd.assert()
+        .success()
+        .stdout(
+            predicate::str::contains("--output <OUTPUT>")
+                .or(predicate::str::contains("--output <output>")),
+        )
+        .stdout(predicate::str::contains("--quiet"))
+        .stdout(predicate::str::contains("human"))
+        .stdout(predicate::str::contains("json"));
+}
+
+#[test]
 fn cli_help_update_help_documents_release_archive_flags_and_version_tag() {
     let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
     cmd.arg("update").arg("--help");
@@ -79,6 +127,22 @@ fn cli_help_update_help_documents_release_archive_flags_and_version_tag() {
                 .or(predicate::str::contains("--version <tag>")),
         )
         .stdout(predicate::str::contains("v1.2.3"));
+}
+
+#[test]
+fn cli_help_output_mode_update_help_lists_output_and_quiet_flags() {
+    let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
+    cmd.arg("update").arg("--help");
+
+    cmd.assert()
+        .success()
+        .stdout(
+            predicate::str::contains("--output <OUTPUT>")
+                .or(predicate::str::contains("--output <output>")),
+        )
+        .stdout(predicate::str::contains("--quiet"))
+        .stdout(predicate::str::contains("human"))
+        .stdout(predicate::str::contains("json"));
 }
 
 #[test]
@@ -114,6 +178,65 @@ fn cli_help_generate_without_prompt_is_usage_error_without_json_envelope() {
         .code(2)
         .stderr(predicate::str::contains("<PROMPT>").or(predicate::str::contains("<prompt>")))
         .stderr(predicate::str::contains("\"error\":").not());
+}
+
+#[test]
+fn cli_help_output_mode_invalid_output_value_is_clap_error_not_json_envelope() {
+    let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
+    cmd.arg("generate")
+        .arg("prompt")
+        .arg("--out")
+        .arg("./images")
+        .arg("--output")
+        .arg("xml");
+
+    cmd.assert()
+        .code(2)
+        .stderr(
+            predicate::str::contains("invalid value")
+                .or(predicate::str::contains("possible values")),
+        )
+        .stderr(predicate::str::contains("\"error\":").not());
+}
+
+#[test]
+fn cli_help_output_mode_missing_generate_prompt_stays_clap_error_with_flags() {
+    let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
+    cmd.arg("generate")
+        .arg("--out")
+        .arg("./images")
+        .arg("--output")
+        .arg("json")
+        .arg("--quiet");
+
+    cmd.assert()
+        .code(2)
+        .stderr(predicate::str::contains("<PROMPT>").or(predicate::str::contains("<prompt>")))
+        .stderr(predicate::str::contains("\"error\":").not());
+}
+
+#[test]
+fn cli_help_output_mode_quiet_with_json_is_accepted_by_clap_and_reaches_dispatch() {
+    let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
+    cmd.arg("generate")
+        .arg("prompt")
+        .arg("--out")
+        .arg("./images")
+        .arg("--output")
+        .arg("json")
+        .arg("--quiet")
+        .env("CODEX_IMAGE_CODEX_BIN", "   ");
+
+    let output = cmd.output().expect("generate command should run");
+
+    assert_eq!(output.status.code(), Some(2));
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf-8 JSON");
+    let envelope: serde_json::Value =
+        serde_json::from_str(stderr.trim_end()).expect("stderr should be json envelope");
+
+    assert_eq!(envelope["error"]["code"], "config.invalid");
+    assert!(!stderr.contains("unexpected argument"));
 }
 
 #[test]
