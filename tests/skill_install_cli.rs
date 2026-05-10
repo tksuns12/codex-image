@@ -7,22 +7,103 @@ use codex_image::skill_installer::{
 use serde_json::Value;
 use tempfile::tempdir;
 
-fn parse_json_line(bytes: Vec<u8>) -> Value {
-    let text = String::from_utf8(bytes).expect("output should be utf-8");
-    let trimmed = text.trim_end();
-    assert_eq!(trimmed.lines().count(), 1, "output must be one JSON line");
-    serde_json::from_str(trimmed).expect("output should be valid json")
-}
-
-fn parse_json_lines(bytes: Vec<u8>) -> Vec<Value> {
+fn parse_json_object(bytes: Vec<u8>) -> Value {
     let text = String::from_utf8(bytes).expect("output should be utf-8");
     let trimmed = text.trim_end();
     assert!(!trimmed.is_empty(), "output must not be empty");
+    assert_eq!(trimmed.lines().count(), 1, "output must be one JSON object");
+    serde_json::from_str(trimmed).expect("output should be valid json")
+}
 
-    trimmed
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("each output line should be valid json"))
-        .collect()
+fn parse_json_line(bytes: Vec<u8>) -> Value {
+    parse_json_object(bytes)
+}
+
+fn results(value: &Value) -> &[Value] {
+    value["results"]
+        .as_array()
+        .expect("payload should contain results array")
+}
+
+fn single_result(value: &Value) -> &Value {
+    let results = results(value);
+    assert_eq!(results.len(), 1, "payload should contain one result");
+    &results[0]
+}
+
+#[test]
+fn skill_install_cli_defaults_to_human_output() {
+    let project = tempdir().expect("project tempdir");
+    let home = tempdir().expect("home tempdir");
+
+    let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
+    let output = cmd
+        .current_dir(project.path())
+        .arg("skill")
+        .arg("install")
+        .arg("--tool")
+        .arg("pi")
+        .arg("--scope")
+        .arg("project")
+        .arg("--yes")
+        .env("HOME", home.path())
+        .output()
+        .expect("install runs");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
+    assert!(
+        stdout.contains("codex-image skill install completed 1 target"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("pi/project: created"), "stdout: {stdout}");
+    assert!(
+        !stdout.trim_start().starts_with('{'),
+        "human output should not be JSON: {stdout}"
+    );
+}
+
+#[test]
+fn skill_install_cli_quiet_suppresses_success_stdout() {
+    let project = tempdir().expect("project tempdir");
+    let home = tempdir().expect("home tempdir");
+
+    let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
+    let output = cmd
+        .current_dir(project.path())
+        .arg("skill")
+        .arg("install")
+        .arg("--tool")
+        .arg("pi")
+        .arg("--scope")
+        .arg("project")
+        .arg("--yes")
+        .arg("--quiet")
+        .env("HOME", home.path())
+        .output()
+        .expect("quiet install runs");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    let expected_path = project
+        .path()
+        .join(".agents")
+        .join("skills")
+        .join("codex-image")
+        .join("SKILL.md");
+    assert!(expected_path.is_file());
 }
 
 #[test]
@@ -40,6 +121,8 @@ fn skill_install_cli_project_install_then_repeat_is_created_then_unchanged() {
         .arg("--scope")
         .arg("project")
         .arg("--yes")
+        .arg("--output")
+        .arg("json")
         .env("HOME", home.path())
         .output()
         .expect("first install runs");
@@ -51,10 +134,12 @@ fn skill_install_cli_project_install_then_repeat_is_created_then_unchanged() {
     );
     assert!(first_output.stderr.is_empty());
 
-    let first_json = parse_json_line(first_output.stdout);
-    assert_eq!(first_json["tool"], "pi");
-    assert_eq!(first_json["scope"], "project");
-    assert_eq!(first_json["status"], "created");
+    let first_json = parse_json_object(first_output.stdout);
+    assert_eq!(first_json["operation"], "install");
+    let first_result = single_result(&first_json);
+    assert_eq!(first_result["tool"], "pi");
+    assert_eq!(first_result["scope"], "project");
+    assert_eq!(first_result["status"], "created");
 
     let expected_path = project
         .path()
@@ -63,7 +148,7 @@ fn skill_install_cli_project_install_then_repeat_is_created_then_unchanged() {
         .join("codex-image")
         .join("SKILL.md");
     assert_eq!(
-        first_json["target_path"].as_str(),
+        first_result["target_path"].as_str(),
         Some(expected_path.to_string_lossy().as_ref())
     );
 
@@ -80,13 +165,16 @@ fn skill_install_cli_project_install_then_repeat_is_created_then_unchanged() {
         .arg("--scope")
         .arg("project")
         .arg("--yes")
+        .arg("--output")
+        .arg("json")
         .env("HOME", home.path())
         .output()
         .expect("second install runs");
 
     assert!(second_output.status.success());
-    let second_json = parse_json_line(second_output.stdout);
-    assert_eq!(second_json["status"], "unchanged");
+    let second_json = parse_json_object(second_output.stdout);
+    assert_eq!(second_json["operation"], "install");
+    assert_eq!(single_result(&second_json)["status"], "unchanged");
     assert_eq!(
         fs::read_to_string(&expected_path).expect("skill file should remain readable"),
         render_managed_skill_content()
@@ -118,6 +206,7 @@ fn skill_install_cli_blocks_manual_edit_by_default_and_force_overwrites() {
         .arg("--scope")
         .arg("project")
         .arg("--yes")
+        .arg("--quiet")
         .env("HOME", home.path())
         .output()
         .expect("blocked install runs");
@@ -148,13 +237,15 @@ fn skill_install_cli_blocks_manual_edit_by_default_and_force_overwrites() {
         .arg("project")
         .arg("--yes")
         .arg("--force")
+        .arg("--output")
+        .arg("json")
         .env("HOME", home.path())
         .output()
         .expect("forced install runs");
 
     assert!(forced_output.status.success());
-    let forced_json = parse_json_line(forced_output.stdout);
-    assert_eq!(forced_json["status"], "forced_overwrite");
+    let forced_json = parse_json_object(forced_output.stdout);
+    assert_eq!(single_result(&forced_json)["status"], "forced_overwrite");
 
     let overwritten = fs::read_to_string(&target).expect("manual file should be overwritten");
     assert_eq!(overwritten, render_managed_skill_content());
@@ -162,7 +253,7 @@ fn skill_install_cli_blocks_manual_edit_by_default_and_force_overwrites() {
 }
 
 #[test]
-fn skill_install_cli_multi_target_repeated_flags_emit_deterministic_json_lines() {
+fn skill_install_cli_multi_target_repeated_flags_emit_deterministic_aggregate_json() {
     let project = tempdir().expect("project tempdir");
     let home = tempdir().expect("home tempdir");
 
@@ -182,6 +273,8 @@ fn skill_install_cli_multi_target_repeated_flags_emit_deterministic_json_lines()
         .arg("--scope")
         .arg("global")
         .arg("--yes")
+        .arg("--output")
+        .arg("json")
         .env("HOME", home.path())
         .output()
         .expect("multi-target install runs");
@@ -193,16 +286,18 @@ fn skill_install_cli_multi_target_repeated_flags_emit_deterministic_json_lines()
     );
     assert!(output.stderr.is_empty());
 
-    let lines = parse_json_lines(output.stdout);
+    let payload = parse_json_object(output.stdout);
+    assert_eq!(payload["operation"], "install");
+    let result_lines = results(&payload);
     assert_eq!(
-        lines.len(),
+        result_lines.len(),
         2,
         "deduped tool/scope should produce 2 targets"
     );
 
-    assert_eq!(lines[0]["tool"], "pi");
-    assert_eq!(lines[0]["scope"], "global");
-    assert_eq!(lines[0]["status"], "created");
+    assert_eq!(result_lines[0]["tool"], "pi");
+    assert_eq!(result_lines[0]["scope"], "global");
+    assert_eq!(result_lines[0]["status"], "created");
 
     let expected_global = home
         .path()
@@ -211,13 +306,13 @@ fn skill_install_cli_multi_target_repeated_flags_emit_deterministic_json_lines()
         .join("codex-image")
         .join("SKILL.md");
     assert_eq!(
-        lines[0]["target_path"].as_str(),
+        result_lines[0]["target_path"].as_str(),
         Some(expected_global.to_string_lossy().as_ref())
     );
 
-    assert_eq!(lines[1]["tool"], "pi");
-    assert_eq!(lines[1]["scope"], "project");
-    assert_eq!(lines[1]["status"], "created");
+    assert_eq!(result_lines[1]["tool"], "pi");
+    assert_eq!(result_lines[1]["scope"], "project");
+    assert_eq!(result_lines[1]["status"], "created");
 
     let expected_project = project
         .path()
@@ -226,7 +321,7 @@ fn skill_install_cli_multi_target_repeated_flags_emit_deterministic_json_lines()
         .join("codex-image")
         .join("SKILL.md");
     assert_eq!(
-        lines[1]["target_path"].as_str(),
+        result_lines[1]["target_path"].as_str(),
         Some(expected_project.to_string_lossy().as_ref())
     );
 
@@ -412,6 +507,8 @@ fn skill_install_cli_update_updates_outdated_managed_file_then_noops_when_curren
         .arg("--scope")
         .arg("project")
         .arg("--yes")
+        .arg("--output")
+        .arg("json")
         .env("HOME", home.path())
         .output()
         .expect("first update runs");
@@ -421,8 +518,9 @@ fn skill_install_cli_update_updates_outdated_managed_file_then_noops_when_curren
         "stderr: {}",
         String::from_utf8_lossy(&first_update_output.stderr)
     );
-    let first_update_json = parse_json_line(first_update_output.stdout);
-    assert_eq!(first_update_json["status"], "updated");
+    let first_update_json = parse_json_object(first_update_output.stdout);
+    assert_eq!(first_update_json["operation"], "update");
+    assert_eq!(single_result(&first_update_json)["status"], "updated");
     assert_eq!(
         fs::read_to_string(&target).expect("updated target should be readable"),
         render_managed_skill_content()
@@ -438,13 +536,16 @@ fn skill_install_cli_update_updates_outdated_managed_file_then_noops_when_curren
         .arg("--scope")
         .arg("project")
         .arg("--yes")
+        .arg("--output")
+        .arg("json")
         .env("HOME", home.path())
         .output()
         .expect("second update runs");
 
     assert!(second_update_output.status.success());
-    let second_update_json = parse_json_line(second_update_output.stdout);
-    assert_eq!(second_update_json["status"], "unchanged");
+    let second_update_json = parse_json_object(second_update_output.stdout);
+    assert_eq!(second_update_json["operation"], "update");
+    assert_eq!(single_result(&second_update_json)["status"], "unchanged");
 }
 
 #[test]
@@ -522,6 +623,8 @@ fn skill_install_cli_global_scope_writes_under_home_directory() {
         .arg("--scope")
         .arg("global")
         .arg("--yes")
+        .arg("--output")
+        .arg("json")
         .env("HOME", home.path())
         .output()
         .expect("global install runs");
@@ -529,9 +632,11 @@ fn skill_install_cli_global_scope_writes_under_home_directory() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
 
-    let json = parse_json_line(output.stdout);
-    assert_eq!(json["scope"], "global");
-    assert_eq!(json["status"], "created");
+    let json = parse_json_object(output.stdout);
+    assert_eq!(json["operation"], "install");
+    let result = single_result(&json);
+    assert_eq!(result["scope"], "global");
+    assert_eq!(result["status"], "created");
 
     let expected_path = home
         .path()
@@ -540,7 +645,7 @@ fn skill_install_cli_global_scope_writes_under_home_directory() {
         .join("codex-image")
         .join("SKILL.md");
     assert_eq!(
-        json["target_path"].as_str(),
+        result["target_path"].as_str(),
         Some(expected_path.to_string_lossy().as_ref())
     );
     assert!(expected_path.is_file());
