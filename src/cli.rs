@@ -7,7 +7,7 @@ use serde::Serialize;
 
 use crate::codex::generate_image_with_codex;
 use crate::diagnostics::CliError;
-use crate::output::write_generation_output_from_files;
+use crate::output::{write_generation_output_from_files, GenerationManifest};
 use crate::skill_install_ux::{
     expand_selected_targets, interactive_target_options, select_interactive_targets,
     DialoguerTargetSelector, InstallTargetSelector, InteractiveSelectionError,
@@ -299,7 +299,6 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
 }
 
 fn generate(prompt: String, out: PathBuf, output: OutputArgs) -> Result<(), CliError> {
-    let _ = (output.should_emit_stdout(), output.is_json());
     let generated = generate_image_with_codex(&prompt, &out)?;
     let manifest = write_generation_output_from_files(
         &prompt,
@@ -307,10 +306,46 @@ fn generate(prompt: String, out: PathBuf, output: OutputArgs) -> Result<(), CliE
         &out,
         &[generated.source_path],
     )?;
-    let line = serde_json::to_string(&manifest).map_err(|_| CliError::OutputWriteFailed)?;
-    println!("{line}");
+
+    if output.should_emit_stdout() {
+        match output.effective_mode() {
+            OutputMode::Json => {
+                let line =
+                    serde_json::to_string(&manifest).map_err(|_| CliError::OutputWriteFailed)?;
+                println!("{line}");
+            }
+            OutputMode::Human => {
+                println!("{}", format_generate_result_human(&manifest, &out));
+            }
+        }
+    }
 
     Ok(())
+}
+
+fn format_generate_result_human(manifest: &GenerationManifest, out_dir: &Path) -> String {
+    let image_count = manifest.images.len();
+    let mut lines = vec![
+        format!(
+            "codex-image generated {image_count} image artifact{}",
+            if image_count == 1 { "" } else { "s" }
+        ),
+        format!("model: {}", manifest.model),
+        format!("out: {}", out_dir.display()),
+        format!("manifest: {}", manifest.manifest_path),
+    ];
+
+    for image in &manifest.images {
+        lines.push(format!(
+            "image[{index}]: {path} ({byte_count} bytes, {format})",
+            index = image.index,
+            path = image.path,
+            byte_count = image.byte_count,
+            format = image.format,
+        ));
+    }
+
+    lines.join("\n")
 }
 
 fn update(
