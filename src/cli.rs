@@ -62,10 +62,6 @@ impl OutputArgs {
     const fn should_emit_stdout(self) -> bool {
         !self.quiet
     }
-
-    const fn is_json(self) -> bool {
-        matches!(self.effective_mode(), OutputMode::Json)
-    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -188,6 +184,13 @@ enum SkillCommandOperation {
 }
 
 impl SkillCommandOperation {
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+            Self::Update => "update",
+        }
+    }
+
     const fn missing_confirmation_error(self) -> CliError {
         match self {
             Self::Install => CliError::MissingInstallConfirmation,
@@ -501,7 +504,6 @@ fn skill_command(
     force: bool,
     output: OutputArgs,
 ) -> Result<(), CliError> {
-    let _ = (output.should_emit_stdout(), output.is_json());
     let interactive_mode = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let selector = DialoguerTargetSelector;
     skill_command_with_selector(
@@ -510,6 +512,7 @@ fn skill_command(
         scopes,
         yes,
         force,
+        output,
         interactive_mode,
         &selector,
     )
@@ -521,6 +524,7 @@ fn skill_command_with_selector(
     scopes: &[ScopeArg],
     yes: bool,
     force: bool,
+    output: OutputArgs,
     interactive_mode: bool,
     selector: &dyn InstallTargetSelector,
 ) -> Result<(), CliError> {
@@ -531,6 +535,7 @@ fn skill_command_with_selector(
         scopes,
         yes,
         force,
+        output,
         interactive_mode,
         selector,
         &project_root,
@@ -556,6 +561,7 @@ fn install_skill_command_with_selector_and_project_root(
         scopes,
         yes,
         force,
+        OutputArgs::default(),
         interactive_mode,
         selector,
         project_root,
@@ -578,6 +584,12 @@ struct SkillActionOutput {
     target_path: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct SkillCommandOutput {
+    operation: &'static str,
+    results: Vec<SkillActionOutput>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum SkillAction {
     InstallOrUpdate(SkillInstallTarget),
@@ -591,6 +603,7 @@ fn skill_command_with_selector_and_project_root(
     scopes: &[ScopeArg],
     yes: bool,
     force: bool,
+    output: OutputArgs,
     interactive_mode: bool,
     selector: &dyn InstallTargetSelector,
     project_root: &Path,
@@ -652,7 +665,14 @@ fn skill_command_with_selector_and_project_root(
         TargetSelectionState::PartialTargets => unreachable!("partial targets already handled"),
     };
 
-    run_skill_action_loop(operation, plan, force, project_root, home_dir_override)
+    run_skill_action_loop(
+        operation,
+        plan,
+        force,
+        output,
+        project_root,
+        home_dir_override,
+    )
 }
 
 fn interactive_uninstall_targets(
@@ -701,6 +721,7 @@ fn run_skill_action_loop(
     operation: SkillCommandOperation,
     plan: SkillCommandPlan,
     force: bool,
+    output: OutputArgs,
     project_root: &Path,
     home_dir_override: Option<&Path>,
 ) -> Result<(), CliError> {
@@ -766,12 +787,60 @@ fn run_skill_action_loop(
         }
     }
 
-    for output in outputs {
-        let line = serde_json::to_string(&output).map_err(|_| CliError::Unknown)?;
+    if let Some(line) = render_skill_action_outputs(operation, outputs, output)? {
         println!("{line}");
     }
 
     Ok(())
+}
+
+fn render_skill_action_outputs(
+    operation: SkillCommandOperation,
+    outputs: Vec<SkillActionOutput>,
+    output: OutputArgs,
+) -> Result<Option<String>, CliError> {
+    if !output.should_emit_stdout() {
+        return Ok(None);
+    }
+
+    match output.effective_mode() {
+        OutputMode::Human => Ok(Some(format_skill_action_outputs(operation, &outputs))),
+        OutputMode::Json => {
+            let payload = SkillCommandOutput {
+                operation: operation.slug(),
+                results: outputs,
+            };
+            let line = serde_json::to_string(&payload).map_err(|_| CliError::OutputWriteFailed)?;
+            Ok(Some(line))
+        }
+    }
+}
+
+fn format_skill_action_outputs(
+    operation: SkillCommandOperation,
+    outputs: &[SkillActionOutput],
+) -> String {
+    let target_count = outputs.len();
+    let mut lines = vec![format!(
+        "codex-image skill {} completed {target_count} target{}",
+        operation.slug(),
+        if target_count == 1 { "" } else { "s" }
+    )];
+
+    for output in outputs {
+        lines.push(format!(
+            "{}: {} -> {}",
+            format_skill_target(output),
+            output.status.replace('_', " "),
+            output.target_path
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn format_skill_target(output: &SkillActionOutput) -> String {
+    format!("{}/{}", output.tool, output.scope)
 }
 
 fn resolve_home_dir(
