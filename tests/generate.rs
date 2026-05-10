@@ -56,7 +56,7 @@ fn write_failing_codex(temp: &TempDir) -> std::path::PathBuf {
 }
 
 #[test]
-fn generate_codex_backend_copies_image_and_writes_manifest() {
+fn generate_codex_backend_copies_image_and_writes_manifest_json_output_mode() {
     let temp = TempDir::new().unwrap();
     let source_image = temp.path().join("codex-source.png");
     fs::write(&source_image, b"codex-image-bytes").unwrap();
@@ -69,6 +69,8 @@ fn generate_codex_backend_copies_image_and_writes_manifest() {
         .arg("red circle")
         .arg("--out")
         .arg(&out_dir)
+        .arg("--output")
+        .arg("json")
         .env("CODEX_IMAGE_CODEX_BIN", &fake_codex)
         .output()
         .unwrap();
@@ -106,9 +108,11 @@ fn generate_codex_backend_copies_image_and_writes_manifest() {
 }
 
 #[test]
-fn generate_codex_failure_maps_to_redacted_json_envelope() {
+fn generate_defaults_to_human_success_output() {
     let temp = TempDir::new().unwrap();
-    let failing_codex = write_failing_codex(&temp);
+    let source_image = temp.path().join("codex-source.png");
+    fs::write(&source_image, b"codex-image-bytes").unwrap();
+    let fake_codex = write_fake_codex(&temp, &source_image);
     let out_dir = temp.path().join("images");
 
     let output = Command::cargo_bin("codex-image")
@@ -117,21 +121,143 @@ fn generate_codex_failure_maps_to_redacted_json_envelope() {
         .arg("red circle")
         .arg("--out")
         .arg(&out_dir)
-        .env("CODEX_IMAGE_CODEX_BIN", &failing_codex)
+        .env("CODEX_IMAGE_CODEX_BIN", &fake_codex)
         .output()
         .unwrap();
 
-    assert_eq!(output.status.code(), Some(4));
-    assert!(output.stdout.is_empty());
-
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    let envelope: Value = serde_json::from_str(stderr.trim_end()).unwrap();
-    assert_eq!(
-        envelope["error"]["code"],
-        "api.codex_image_generation_failed"
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!stderr.contains("Bearer"));
-    assert!(!stderr.contains("secret"));
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let trimmed = stdout.trim_end();
+    assert!(!trimmed.is_empty(), "human output should not be empty");
+    assert!(
+        !trimmed.trim_start().starts_with('{'),
+        "default generate output should be human-readable"
+    );
+
+    assert!(trimmed.contains("codex-image generated 1 image"));
+    assert!(trimmed.contains("model: gpt-image-2"));
+    assert!(trimmed.contains(&format!("out: {}", out_dir.display())));
+    assert!(trimmed.contains("manifest:"));
+    assert!(trimmed.contains("image[1]:"));
+}
+
+#[test]
+fn generate_quiet_success_suppresses_stdout_but_still_writes_artifacts() {
+    let temp = TempDir::new().unwrap();
+    let source_image = temp.path().join("codex-source.png");
+    fs::write(&source_image, b"codex-image-bytes").unwrap();
+    let fake_codex = write_fake_codex(&temp, &source_image);
+    let out_dir = temp.path().join("images");
+
+    let output = Command::cargo_bin("codex-image")
+        .unwrap()
+        .arg("generate")
+        .arg("red circle")
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--quiet")
+        .env("CODEX_IMAGE_CODEX_BIN", &fake_codex)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    let manifest_path = out_dir.join("manifest.json");
+    assert!(manifest_path.is_file());
+    let manifest_text = fs::read_to_string(&manifest_path).unwrap();
+    let manifest: Value = serde_json::from_str(&manifest_text).unwrap();
+    assert_eq!(manifest["prompt"], "red circle");
+}
+
+#[test]
+fn generate_output_json_with_quiet_suppresses_stdout_and_still_writes_manifest() {
+    let temp = TempDir::new().unwrap();
+    let source_image = temp.path().join("codex-source.png");
+    fs::write(&source_image, b"codex-image-bytes").unwrap();
+    let fake_codex = write_fake_codex(&temp, &source_image);
+    let out_dir = temp.path().join("images");
+
+    let output = Command::cargo_bin("codex-image")
+        .unwrap()
+        .arg("generate")
+        .arg("red circle")
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--output")
+        .arg("json")
+        .arg("--quiet")
+        .env("CODEX_IMAGE_CODEX_BIN", &fake_codex)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    let manifest_path = out_dir.join("manifest.json");
+    assert!(manifest_path.is_file());
+    let manifest_text = fs::read_to_string(&manifest_path).unwrap();
+    let manifest: Value = serde_json::from_str(&manifest_text).unwrap();
+    assert_eq!(manifest["prompt"], "red circle");
+}
+
+#[test]
+fn generate_codex_failure_with_output_flags_maps_to_redacted_json_envelope() {
+    let temp = TempDir::new().unwrap();
+    let failing_codex = write_failing_codex(&temp);
+
+    for (label, args) in [
+        ("quiet", vec!["--quiet"]),
+        ("output-json", vec!["--output", "json"]),
+        ("output-json-quiet", vec!["--output", "json", "--quiet"]),
+    ] {
+        let out_dir = temp.path().join(format!("images-{label}"));
+        let mut cmd = Command::cargo_bin("codex-image").unwrap();
+        cmd.arg("generate")
+            .arg("red circle")
+            .arg("--out")
+            .arg(&out_dir)
+            .env("CODEX_IMAGE_CODEX_BIN", &failing_codex);
+        for arg in args {
+            cmd.arg(arg);
+        }
+
+        let output = cmd.output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(4),
+            "expected api failure exit for {label}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "stdout should stay empty on failure for {label}"
+        );
+
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let envelope: Value = serde_json::from_str(stderr.trim_end()).unwrap();
+        assert_eq!(
+            envelope["error"]["code"],
+            "api.codex_image_generation_failed"
+        );
+        assert!(!stderr.contains("Bearer"));
+        assert!(!stderr.contains("secret"));
+    }
 }
 
 #[test]
