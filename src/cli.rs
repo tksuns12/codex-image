@@ -354,7 +354,6 @@ fn update(
     version: Option<String>,
     output: OutputArgs,
 ) -> Result<(), CliError> {
-    let _ = (output.should_emit_stdout(), output.is_json());
     let client = GitHubReleaseClient::new(UPDATE_REPOSITORY)?;
     let installer = FilesystemBinaryInstaller;
     let current_executable =
@@ -370,7 +369,7 @@ fn update(
         version,
     )?;
 
-    print_update_result(&result)
+    print_update_result(&result, output)
 }
 
 pub fn execute_update_command<S: UpdateSource, I: BinaryInstaller>(
@@ -393,9 +392,29 @@ pub fn execute_update_command<S: UpdateSource, I: BinaryInstaller>(
     run_update_with_installer(source, &options, installer).map_err(Into::into)
 }
 
-fn print_update_result(result: &UpdateResult) -> Result<(), CliError> {
-    println!("{}", format_update_result(result));
+fn print_update_result(result: &UpdateResult, output: OutputArgs) -> Result<(), CliError> {
+    if let Some(line) = render_update_result(result, output)? {
+        println!("{line}");
+    }
+
     Ok(())
+}
+
+fn render_update_result(
+    result: &UpdateResult,
+    output: OutputArgs,
+) -> Result<Option<String>, CliError> {
+    if !output.should_emit_stdout() {
+        return Ok(None);
+    }
+
+    match output.effective_mode() {
+        OutputMode::Human => Ok(Some(format_update_result(result))),
+        OutputMode::Json => {
+            let line = serde_json::to_string(result).map_err(|_| CliError::OutputWriteFailed)?;
+            Ok(Some(line))
+        }
+    }
 }
 
 fn format_update_result(result: &UpdateResult) -> String {
@@ -449,14 +468,28 @@ fn dispatch_skill(command: SkillCommands) -> Result<(), CliError> {
             yes,
             force,
             output,
-        } => skill_command(SkillCommandOperation::Install, &tool, &scope, yes, force, output),
+        } => skill_command(
+            SkillCommandOperation::Install,
+            &tool,
+            &scope,
+            yes,
+            force,
+            output,
+        ),
         SkillCommands::Update {
             tool,
             scope,
             yes,
             force,
             output,
-        } => skill_command(SkillCommandOperation::Update, &tool, &scope, yes, force, output),
+        } => skill_command(
+            SkillCommandOperation::Update,
+            &tool,
+            &scope,
+            yes,
+            force,
+            output,
+        ),
     }
 }
 
@@ -778,8 +811,8 @@ mod tests {
     use std::cell::RefCell;
 
     use super::{
-        format_update_result, install_skill_command_with_selector_and_project_root, ScopeArg,
-        ToolArg,
+        format_update_result, install_skill_command_with_selector_and_project_root,
+        render_update_result, OutputArgs, OutputMode, ScopeArg, ToolArg,
     };
     use crate::diagnostics::CliError;
     use crate::skill_install_ux::{
@@ -818,16 +851,96 @@ mod tests {
         }
     }
 
-    #[test]
-    fn update_result_renderer_uses_human_text_for_success() {
-        let output = format_update_result(&UpdateResult {
+    fn fixture_updated_result() -> UpdateResult {
+        UpdateResult {
             status: "updated".to_string(),
             current_version: "0.1.0".to_string(),
             target_version: "v1.2.3".to_string(),
             target: "x86_64-unknown-linux-gnu".to_string(),
             asset: "codex-image-v1.2.3-x86_64-unknown-linux-gnu.tar.gz".to_string(),
             binary_path: "/tmp/codex-image".to_string(),
-        });
+        }
+    }
+
+    fn fixture_validated_result() -> UpdateResult {
+        UpdateResult {
+            status: "validated".to_string(),
+            current_version: "0.1.0".to_string(),
+            target_version: "v1.2.3".to_string(),
+            target: "x86_64-apple-darwin".to_string(),
+            asset: "codex-image-v1.2.3-x86_64-apple-darwin.tar.gz".to_string(),
+            binary_path: "/usr/local/bin/codex-image".to_string(),
+        }
+    }
+
+    #[test]
+    fn update_output_mode_defaults_to_human_text() {
+        let rendered = render_update_result(&fixture_updated_result(), OutputArgs::default())
+            .expect("human rendering should succeed")
+            .expect("default mode should emit stdout");
+
+        assert!(rendered.contains("codex-image updated from 0.1.0 to v1.2.3"));
+        assert!(rendered.contains("target: x86_64-unknown-linux-gnu"));
+        assert!(!rendered.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn update_output_mode_json_serializes_single_update_result_object() {
+        let rendered = render_update_result(
+            &fixture_updated_result(),
+            OutputArgs {
+                output: OutputMode::Json,
+                quiet: false,
+            },
+        )
+        .expect("json rendering should succeed")
+        .expect("json mode should emit stdout");
+
+        assert_eq!(
+            rendered.lines().count(),
+            1,
+            "json output must be single-line"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&rendered).expect("rendered JSON should parse");
+        assert_eq!(json["status"], "updated");
+        assert_eq!(json["target_version"], "v1.2.3");
+        assert_eq!(json["target"], "x86_64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn update_output_mode_quiet_suppresses_validated_and_updated_stdout() {
+        let quiet_human = render_update_result(
+            &fixture_updated_result(),
+            OutputArgs {
+                output: OutputMode::Human,
+                quiet: true,
+            },
+        )
+        .expect("quiet human rendering should not error");
+        assert!(
+            quiet_human.is_none(),
+            "quiet should suppress updated stdout"
+        );
+
+        let quiet_json = render_update_result(
+            &fixture_validated_result(),
+            OutputArgs {
+                output: OutputMode::Json,
+                quiet: true,
+            },
+        )
+        .expect("quiet json rendering should not error");
+        assert!(
+            quiet_json.is_none(),
+            "quiet should suppress validated stdout"
+        );
+    }
+
+    #[test]
+    fn update_result_renderer_uses_human_text_for_success() {
+        let output = format_update_result(&fixture_updated_result());
 
         assert!(output.contains("codex-image updated from 0.1.0 to v1.2.3"));
         assert!(output.contains("target: x86_64-unknown-linux-gnu"));
@@ -838,14 +951,7 @@ mod tests {
 
     #[test]
     fn update_result_renderer_uses_human_text_for_dry_run() {
-        let output = format_update_result(&UpdateResult {
-            status: "validated".to_string(),
-            current_version: "0.1.0".to_string(),
-            target_version: "v1.2.3".to_string(),
-            target: "x86_64-apple-darwin".to_string(),
-            asset: "codex-image-v1.2.3-x86_64-apple-darwin.tar.gz".to_string(),
-            binary_path: "/usr/local/bin/codex-image".to_string(),
-        });
+        let output = format_update_result(&fixture_validated_result());
 
         assert!(output.contains("codex-image update validated v1.2.3 for x86_64-apple-darwin"));
         assert!(output.contains("asset: codex-image-v1.2.3-x86_64-apple-darwin.tar.gz"));

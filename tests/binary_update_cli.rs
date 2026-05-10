@@ -55,10 +55,12 @@ fn update_cli_helper_no_flags_updates_latest_release_by_default() {
 }
 
 #[test]
-fn update_cli_invalid_version_uses_clap_stderr_not_json_envelope() {
+fn update_cli_invalid_version_with_output_json_uses_clap_stderr_not_json_envelope() {
     let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
     cmd.arg("update")
         .arg("--dry-run")
+        .arg("--output")
+        .arg("json")
         .arg("--version")
         .arg("1.2.3");
 
@@ -182,6 +184,87 @@ fn update_cli_helper_invalid_archive_maps_to_response_contract_cli_error() {
         "response_contract.update_archive_invalid"
     );
     assert_eq!(installer.calls(), 0, "failed validation must not replace");
+}
+
+#[test]
+fn update_cli_helper_release_lookup_failure_maps_to_binary_update_cli_error() {
+    let source = FakeSource::new().with_release_result(Err(UpdateError::ReleaseLookupFailed));
+    let installer = RecordingInstaller::default();
+
+    let temp = tempdir().expect("tempdir");
+    let binary_path = temp.path().join(current_binary_name());
+
+    let err = execute_update_command(
+        &source,
+        &installer,
+        binary_path,
+        env!("CARGO_PKG_VERSION").to_string(),
+        false,
+        true,
+        Some("v1.2.3".to_string()),
+    )
+    .expect_err("release lookup failure must bubble as CliError::BinaryUpdate");
+
+    assert!(
+        matches!(
+            err,
+            CliError::BinaryUpdate(UpdateError::ReleaseLookupFailed)
+        ),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(
+        installer.calls(),
+        0,
+        "failed lookup must not replace binary"
+    );
+
+    let envelope = err.error_envelope();
+    assert_eq!(envelope.error.code, "api.update_release_lookup_failed");
+}
+
+#[test]
+fn update_cli_helper_download_failure_maps_to_binary_update_cli_error() {
+    let source = FakeSource::new()
+        .with_release_result(Ok(
+            parse_release_metadata(release_fixture()).expect("release fixture")
+        ))
+        .with_download_result(Err(UpdateError::AssetDownloadFailed));
+    let installer = RecordingInstaller::default();
+
+    let temp = tempdir().expect("tempdir");
+    let binary_path = temp.path().join(current_binary_name());
+
+    let err = execute_update_command(
+        &source,
+        &installer,
+        binary_path,
+        env!("CARGO_PKG_VERSION").to_string(),
+        false,
+        true,
+        Some("v1.2.3".to_string()),
+    )
+    .expect_err("download failure must bubble as CliError::BinaryUpdate");
+
+    assert!(
+        matches!(
+            err,
+            CliError::BinaryUpdate(UpdateError::AssetDownloadFailed)
+        ),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(
+        source.download_calls(),
+        1,
+        "download should be attempted once"
+    );
+    assert_eq!(
+        installer.calls(),
+        0,
+        "failed download must not replace binary"
+    );
+
+    let envelope = err.error_envelope();
+    assert_eq!(envelope.error.code, "api.update_asset_download_failed");
 }
 
 #[derive(Default)]
