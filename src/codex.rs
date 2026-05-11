@@ -9,7 +9,22 @@ use serde::Deserialize;
 use crate::config::{read_non_empty_env_path, ENV_CODEX_BIN};
 use crate::diagnostics::CliError;
 
-const CODEX_EXEC_TIMEOUT: Duration = Duration::from_secs(300);
+pub const DEFAULT_CODEX_EXEC_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_CODEX_EXEC_TIMEOUT: Duration =
+    Duration::from_secs(DEFAULT_CODEX_EXEC_TIMEOUT_SECS);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodexGenerationOptions {
+    pub timeout: Duration,
+}
+
+impl Default for CodexGenerationOptions {
+    fn default() -> Self {
+        Self {
+            timeout: DEFAULT_CODEX_EXEC_TIMEOUT,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexImageGeneration {
@@ -28,6 +43,14 @@ pub fn generate_image_with_codex(
     prompt: &str,
     out_dir: &Path,
 ) -> Result<CodexImageGeneration, CliError> {
+    generate_image_with_codex_with_options(prompt, out_dir, CodexGenerationOptions::default())
+}
+
+pub fn generate_image_with_codex_with_options(
+    prompt: &str,
+    out_dir: &Path,
+    options: CodexGenerationOptions,
+) -> Result<CodexImageGeneration, CliError> {
     fs::create_dir_all(out_dir).map_err(|_| CliError::OutputWriteFailed)?;
 
     let codex_bin = resolve_codex_binary()?;
@@ -38,7 +61,7 @@ pub fn generate_image_with_codex(
     let _ = fs::remove_file(&last_message_path);
 
     let codex_prompt = build_codex_prompt(prompt);
-    let status = Command::new(&codex_bin)
+    let mut child = Command::new(&codex_bin)
         .arg("exec")
         .arg("--skip-git-repo-check")
         .arg("--sandbox")
@@ -56,8 +79,12 @@ pub fn generate_image_with_codex(
         .spawn()
         .map_err(|_| CliError::CodexImageGenerationFailed {
             source_message: "failed to spawn Codex CLI".to_string(),
-        })?
-        .wait_timeout(CODEX_EXEC_TIMEOUT)?;
+        })?;
+
+    let status = child.wait_timeout(options.timeout).map_err(|err| {
+        let _ = fs::remove_file(&last_message_path);
+        err
+    })?;
 
     if !status.success() {
         let _ = fs::remove_file(&last_message_path);
@@ -67,6 +94,7 @@ pub fn generate_image_with_codex(
     }
 
     let final_message = fs::read_to_string(&last_message_path).map_err(|_| {
+        let _ = fs::remove_file(&last_message_path);
         CliError::ImageGenerationResponseContract {
             source_message: "Codex CLI did not write final image JSON".to_string(),
         }

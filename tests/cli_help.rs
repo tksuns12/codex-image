@@ -7,7 +7,7 @@ fn cli_help_binary_exists_as_codex_image() {
 }
 
 #[test]
-fn cli_help_generate_help_documents_required_out_and_prompt_contract() {
+fn cli_help_generate_help_documents_required_out_prompt_and_timeout_contract() {
     let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
     cmd.arg("generate").arg("--help");
 
@@ -15,7 +15,13 @@ fn cli_help_generate_help_documents_required_out_and_prompt_contract() {
         .success()
         .stdout(predicate::str::contains("--out"))
         .stdout(predicate::str::contains("prompt"))
-        .stdout(predicate::str::contains("Codex"));
+        .stdout(predicate::str::contains("Codex"))
+        .stdout(
+            predicate::str::contains("--timeout <SECS>")
+                .or(predicate::str::contains("--timeout <secs>")),
+        )
+        .stdout(predicate::str::contains("subprocess timeout"))
+        .stdout(predicate::str::contains("default: 300"));
 }
 
 #[test]
@@ -181,6 +187,61 @@ fn cli_help_generate_without_prompt_is_usage_error_without_json_envelope() {
 }
 
 #[test]
+fn cli_help_generate_timeout_zero_is_clap_usage_error_without_json_envelope() {
+    let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
+    cmd.arg("generate")
+        .arg("prompt")
+        .arg("--out")
+        .arg("./images")
+        .arg("--timeout")
+        .arg("0");
+
+    cmd.assert()
+        .code(2)
+        .stderr(predicate::str::contains("timeout"))
+        .stderr(predicate::str::contains("\"error\":").not());
+}
+
+#[test]
+fn cli_help_generate_timeout_negative_is_clap_usage_error_without_json_envelope() {
+    let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
+    cmd.arg("generate")
+        .arg("prompt")
+        .arg("--out")
+        .arg("./images")
+        .arg("--timeout")
+        .arg("-1");
+
+    cmd.assert()
+        .code(2)
+        .stderr(
+            predicate::str::contains("unexpected argument")
+                .or(predicate::str::contains("invalid value"))
+                .or(predicate::str::contains("positive integer")),
+        )
+        .stderr(predicate::str::contains("\"error\":").not());
+}
+
+#[test]
+fn cli_help_generate_timeout_non_integer_is_clap_usage_error_without_json_envelope() {
+    let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
+    cmd.arg("generate")
+        .arg("prompt")
+        .arg("--out")
+        .arg("./images")
+        .arg("--timeout")
+        .arg("abc");
+
+    cmd.assert()
+        .code(2)
+        .stderr(
+            predicate::str::contains("invalid value")
+                .or(predicate::str::contains("positive integer")),
+        )
+        .stderr(predicate::str::contains("\"error\":").not());
+}
+
+#[test]
 fn cli_help_output_mode_invalid_output_value_is_clap_error_not_json_envelope() {
     let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
     cmd.arg("generate")
@@ -216,12 +277,14 @@ fn cli_help_output_mode_missing_generate_prompt_stays_clap_error_with_flags() {
 }
 
 #[test]
-fn cli_help_output_mode_quiet_with_json_is_accepted_by_clap_and_reaches_dispatch() {
+fn cli_help_generate_timeout_output_json_quiet_is_accepted_by_clap_and_reaches_dispatch() {
     let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
     cmd.arg("generate")
         .arg("prompt")
         .arg("--out")
         .arg("./images")
+        .arg("--timeout")
+        .arg("1")
         .arg("--output")
         .arg("json")
         .arg("--quiet")

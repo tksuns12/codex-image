@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-use crate::codex::generate_image_with_codex;
+use crate::codex::{
+    generate_image_with_codex_with_options, CodexGenerationOptions, DEFAULT_CODEX_EXEC_TIMEOUT_SECS,
+};
 use crate::diagnostics::CliError;
 use crate::output::{write_generation_output_from_files, GenerationManifest};
 use crate::skill_install_ux::{
@@ -73,6 +75,14 @@ enum Commands {
         /// Output directory where generated image files and manifest.json are written.
         #[arg(long, value_name = "DIR")]
         out: PathBuf,
+        /// Local Codex subprocess timeout in seconds.
+        #[arg(
+            long,
+            value_name = "SECS",
+            value_parser = parse_positive_timeout_secs,
+            default_value_t = DEFAULT_CODEX_EXEC_TIMEOUT_SECS
+        )]
+        timeout: u64,
         #[command(flatten)]
         output: OutputArgs,
     },
@@ -289,8 +299,9 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
         Commands::Generate {
             prompt,
             out,
+            timeout,
             output,
-        } => generate(prompt, out, output),
+        } => generate(prompt, out, timeout, output),
         Commands::Update {
             yes,
             dry_run,
@@ -301,8 +312,19 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
     }
 }
 
-fn generate(prompt: String, out: PathBuf, output: OutputArgs) -> Result<(), CliError> {
-    let generated = generate_image_with_codex(&prompt, &out)?;
+fn generate(
+    prompt: String,
+    out: PathBuf,
+    timeout: u64,
+    output: OutputArgs,
+) -> Result<(), CliError> {
+    let generated = generate_image_with_codex_with_options(
+        &prompt,
+        &out,
+        CodexGenerationOptions {
+            timeout: std::time::Duration::from_secs(timeout),
+        },
+    )?;
     let manifest = write_generation_output_from_files(
         &prompt,
         GPT_IMAGE_MODEL,
@@ -445,6 +467,18 @@ fn format_update_result(result: &UpdateResult) -> String {
             binary_path = result.binary_path,
         ),
     }
+}
+
+fn parse_positive_timeout_secs(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| "timeout seconds must be a positive integer".to_string())?;
+
+    if parsed == 0 {
+        return Err("timeout seconds must be greater than 0".to_string());
+    }
+
+    Ok(parsed)
 }
 
 fn parse_release_tag(value: &str) -> Result<String, String> {
