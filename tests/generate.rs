@@ -458,8 +458,8 @@ fn generate_timeout_is_local_only_and_not_forwarded_to_codex_subprocess() {
     );
     assert!(output.stderr.is_empty());
 
-    let manifest: Value = serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim_end())
-        .unwrap();
+    let manifest: Value =
+        serde_json::from_str(String::from_utf8(output.stdout).unwrap().trim_end()).unwrap();
     assert_eq!(manifest["prompt"], "timeout forwarding probe");
 
     let argv = fs::read_to_string(&argv_log).unwrap();
