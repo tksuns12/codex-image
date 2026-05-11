@@ -20,6 +20,26 @@ pub struct GenerationManifest {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BatchGenerationManifest {
+    pub mode: &'static str,
+    pub prompt_file: String,
+    pub model: String,
+    pub manifest_path: String,
+    pub item_count: usize,
+    pub items: Vec<BatchGenerationItemManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BatchGenerationItemManifest {
+    pub index: usize,
+    pub prompt: String,
+    pub out_dir: String,
+    pub manifest_path: String,
+    pub images: Vec<GeneratedImageArtifact>,
+    pub response: GenerationResponseMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct GeneratedImageArtifact {
     pub index: usize,
     pub path: String,
@@ -122,6 +142,72 @@ pub fn write_generation_output_from_files(
     }
 
     Ok(manifest)
+}
+
+pub fn write_batch_generation_manifest(
+    prompt_file: &Path,
+    model: &str,
+    out_dir: &Path,
+    item_manifests: &[GenerationManifest],
+) -> Result<BatchGenerationManifest, CliError> {
+    if item_manifests.is_empty() {
+        return Err(CliError::ImageGenerationResponseContract {
+            source_message: "Codex batch generation response missing item manifests".to_string(),
+        });
+    }
+
+    fs::create_dir_all(out_dir).map_err(|_| CliError::OutputWriteFailed)?;
+
+    let mut items = Vec::with_capacity(item_manifests.len());
+    for (idx, item_manifest) in item_manifests.iter().enumerate() {
+        let item_manifest_path = PathBuf::from(&item_manifest.manifest_path);
+        let item_out_dir = item_manifest_path
+            .parent()
+            .ok_or(CliError::OutputVerificationFailed)?;
+
+        if !item_manifest_path.is_file() || !item_out_dir.is_dir() {
+            return Err(CliError::OutputVerificationFailed);
+        }
+
+        items.push(BatchGenerationItemManifest {
+            index: idx + 1,
+            prompt: item_manifest.prompt.clone(),
+            out_dir: path_to_string(item_out_dir),
+            manifest_path: item_manifest.manifest_path.clone(),
+            images: item_manifest.images.clone(),
+            response: item_manifest.response.clone(),
+        });
+    }
+
+    let manifest_path = out_dir.join(MANIFEST_FILE);
+    let manifest = BatchGenerationManifest {
+        mode: "batch",
+        prompt_file: path_to_string(prompt_file),
+        model: model.to_string(),
+        manifest_path: path_to_string(&manifest_path),
+        item_count: items.len(),
+        items,
+    };
+
+    let manifest_json =
+        serde_json::to_vec_pretty(&manifest).map_err(|_| CliError::OutputWriteFailed)?;
+    atomic_write_bytes(&manifest_path, &manifest_json).map_err(|_| CliError::OutputWriteFailed)?;
+
+    if !manifest_path.is_file() {
+        return Err(CliError::OutputVerificationFailed);
+    }
+
+    Ok(manifest)
+}
+
+pub fn remove_batch_manifest_if_exists(out_dir: &Path) -> Result<(), CliError> {
+    let manifest_path = out_dir.join(MANIFEST_FILE);
+
+    match fs::remove_file(manifest_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(CliError::OutputWriteFailed),
+    }
 }
 
 fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
