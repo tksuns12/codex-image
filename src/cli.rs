@@ -472,6 +472,11 @@ fn format_batch_generate_result_human(
             image_count = item.images.len(),
             plural = if item.images.len() == 1 { "" } else { "s" }
         ));
+        lines.push(format!(
+            "item_manifest[{index}]: {manifest_path}",
+            index = item.index,
+            manifest_path = item.manifest_path,
+        ));
     }
 
     lines.join("\n")
