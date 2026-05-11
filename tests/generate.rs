@@ -134,6 +134,74 @@ printf '{{"image_path":"{source_image}","note":"fake codex generated image"}}' >
     script_path
 }
 
+fn write_batch_arg_recording_codex(
+    temp: &TempDir,
+    first_source_image: &std::path::Path,
+    second_source_image: &std::path::Path,
+    argv_log: &std::path::Path,
+) -> std::path::PathBuf {
+    let script_path = temp.path().join("batch-arg-recording-codex");
+    let counter_file = temp.path().join("batch-codex-counter");
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set -eu
+last_message=""
+counter_file="{counter_file}"
+if [ ! -f "$counter_file" ]; then
+  printf '0' > "$counter_file"
+fi
+call_count=$(cat "$counter_file")
+call_count=$((call_count + 1))
+printf '%s' "$call_count" > "$counter_file"
+
+printf 'CALL %s\n' "$call_count" >> "{argv_log}"
+for arg in "$@"; do
+  printf '%s\n' "$arg" >> "{argv_log}"
+done
+printf -- '---\n' >> "{argv_log}"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output-last-message)
+      shift
+      last_message="$1"
+      ;;
+  esac
+  shift || true
+done
+if [ -z "$last_message" ]; then
+  exit 41
+fi
+
+case "$call_count" in
+  1)
+    image_path="{first_source_image}"
+    ;;
+  2)
+    image_path="{second_source_image}"
+    ;;
+  *)
+    exit 43
+    ;;
+esac
+
+printf '{{"image_path":"%s","note":"fake codex generated image"}}' "$image_path" > "$last_message"
+"#,
+        counter_file = counter_file.display(),
+        argv_log = argv_log.display(),
+        first_source_image = first_source_image.display(),
+        second_source_image = second_source_image.display(),
+    );
+    fs::write(&script_path, script).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+    }
+    script_path
+}
+
 fn count_last_message_artifacts(out_dir: &std::path::Path) -> usize {
     fs::read_dir(out_dir)
         .unwrap()
@@ -475,6 +543,103 @@ fn generate_timeout_is_local_only_and_not_forwarded_to_codex_subprocess() {
 }
 
 #[test]
+fn generate_batch_success_from_prompt_file_writes_item_outputs_and_root_json_contract() {
+    let temp = TempDir::new().unwrap();
+    let first_source_image = temp.path().join("codex-source-one.png");
+    let second_source_image = temp.path().join("codex-source-two.png");
+    fs::write(&first_source_image, b"first-image-bytes").unwrap();
+    fs::write(&second_source_image, b"second-image-bytes").unwrap();
+
+    let argv_log = temp.path().join("batch-codex-argv.log");
+    let fake_codex = write_batch_arg_recording_codex(
+        &temp,
+        &first_source_image,
+        &second_source_image,
+        &argv_log,
+    );
+
+    let prompt_file = temp.path().join("prompts.txt");
+    fs::write(
+        &prompt_file,
+        "\n# top comment\r\n   # indented comment\r\n first prompt  \r\n\r\nsecond prompt\t\n",
+    )
+    .unwrap();
+
+    let out_dir = temp.path().join("out");
+    let output = Command::cargo_bin("codex-image")
+        .unwrap()
+        .arg("generate")
+        .arg("--prompt-file")
+        .arg(&prompt_file)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--output")
+        .arg("json")
+        .arg("--timeout")
+        .arg("7")
+        .env("CODEX_IMAGE_CODEX_BIN", &fake_codex)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let trimmed = stdout.trim_end();
+    assert_eq!(trimmed.lines().count(), 1, "stdout must be one JSON object");
+
+    let stdout_manifest: Value = serde_json::from_str(trimmed).unwrap();
+    assert_eq!(stdout_manifest["mode"], "batch");
+    assert_eq!(stdout_manifest["item_count"], 2);
+    assert_eq!(stdout_manifest["items"][0]["prompt"], "first prompt");
+    assert_eq!(stdout_manifest["items"][1]["prompt"], "second prompt");
+
+    let root_manifest_path = out_dir.join("manifest.json");
+    assert!(root_manifest_path.is_file(), "root manifest should exist");
+    let root_manifest: Value =
+        serde_json::from_str(&fs::read_to_string(&root_manifest_path).unwrap()).unwrap();
+    assert_eq!(root_manifest, stdout_manifest);
+
+    assert_eq!(
+        root_manifest["prompt_file"],
+        prompt_file.to_string_lossy().to_string()
+    );
+
+    let item_one_dir = out_dir.join("item-0001");
+    let item_two_dir = out_dir.join("item-0002");
+    let item_three_dir = out_dir.join("item-0003");
+
+    assert!(item_one_dir.is_dir());
+    assert!(item_two_dir.is_dir());
+    assert!(!item_three_dir.exists());
+
+    let item_one_image = item_one_dir.join("image-0001.png");
+    let item_two_image = item_two_dir.join("image-0001.png");
+    assert!(item_one_image.is_file());
+    assert!(item_two_image.is_file());
+    assert!(item_one_dir.join("manifest.json").is_file());
+    assert!(item_two_dir.join("manifest.json").is_file());
+    assert_eq!(fs::read(item_one_image).unwrap(), b"first-image-bytes");
+    assert_eq!(fs::read(item_two_image).unwrap(), b"second-image-bytes");
+
+    let argv = fs::read_to_string(&argv_log).unwrap();
+    assert_eq!(argv.matches("CALL ").count(), 2, "Codex should run twice");
+    let argv_tokens: Vec<&str> = argv.lines().collect();
+    assert!(
+        !argv_tokens.iter().any(|arg| *arg == "--timeout"),
+        "timeout flag must not be forwarded to Codex subprocess"
+    );
+    assert!(
+        !argv_tokens.iter().any(|arg| *arg == "7"),
+        "timeout value must not be forwarded to Codex subprocess"
+    );
+}
+
+#[test]
 fn generate_missing_codex_maps_to_config_error() {
     let temp = TempDir::new().unwrap();
     let out_dir = temp.path().join("images");
@@ -525,13 +690,20 @@ fn generate_filesystem_failure_maps_to_exit_5_when_out_is_existing_file() {
 
 #[test]
 fn generate_clap_usage_errors_emit_no_json_envelope() {
-    let mut missing_prompt = Command::cargo_bin("codex-image").unwrap();
-    missing_prompt.arg("generate").arg("--out").arg("./images");
+    let mut missing_prompt_source = Command::cargo_bin("codex-image").unwrap();
+    missing_prompt_source
+        .arg("generate")
+        .arg("--out")
+        .arg("./images");
 
-    missing_prompt
+    missing_prompt_source
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("<PROMPT>").or(predicate::str::contains("<prompt>")))
+        .stderr(
+            predicate::str::contains("--prompt-file")
+                .or(predicate::str::contains("<PROMPT>"))
+                .or(predicate::str::contains("<prompt>")),
+        )
         .stderr(predicate::str::contains("\"error\":").not());
 
     let mut missing_out = Command::cargo_bin("codex-image").unwrap();

@@ -9,7 +9,10 @@ use crate::codex::{
     generate_image_with_codex_with_options, CodexGenerationOptions, DEFAULT_CODEX_EXEC_TIMEOUT_SECS,
 };
 use crate::diagnostics::CliError;
-use crate::output::{write_generation_output_from_files, GenerationManifest};
+use crate::output::{
+    remove_batch_manifest_if_exists, write_batch_generation_manifest,
+    write_generation_output_from_files, BatchGenerationManifest, GenerationManifest,
+};
 use crate::skill_install_ux::{
     expand_selected_targets, interactive_target_options, select_interactive_targets,
     DialoguerTargetSelector, InstallTargetSelector, InteractiveSelectionError,
@@ -71,7 +74,16 @@ enum Commands {
     /// Generate image artifacts and a manifest for the provided prompt via installed Codex.
     Generate {
         /// Prompt text passed to Codex's built-in image generation tool.
-        prompt: String,
+        #[arg(value_name = "PROMPT", required_unless_present = "prompt_file")]
+        prompt: Option<String>,
+        /// Line-based prompt file for sequential batch generation.
+        #[arg(
+            long,
+            value_name = "FILE",
+            required_unless_present = "prompt",
+            conflicts_with = "prompt"
+        )]
+        prompt_file: Option<PathBuf>,
         /// Output directory where generated image files and manifest.json are written.
         #[arg(long, value_name = "DIR")]
         out: PathBuf,
@@ -298,10 +310,11 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Commands::Generate {
             prompt,
+            prompt_file,
             out,
             timeout,
             output,
-        } => generate(prompt, out, timeout, output),
+        } => generate(prompt, prompt_file, out, timeout, output),
         Commands::Update {
             yes,
             dry_run,
@@ -313,34 +326,33 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
 }
 
 fn generate(
-    prompt: String,
+    prompt: Option<String>,
+    prompt_file: Option<PathBuf>,
     out: PathBuf,
     timeout: u64,
     output: OutputArgs,
 ) -> Result<(), CliError> {
-    let generated = generate_image_with_codex_with_options(
-        &prompt,
-        &out,
-        CodexGenerationOptions {
-            timeout: std::time::Duration::from_secs(timeout),
-        },
-    )?;
-    let manifest = write_generation_output_from_files(
-        &prompt,
-        GPT_IMAGE_MODEL,
-        &out,
-        &[generated.source_path],
-    )?;
+    let timeout = std::time::Duration::from_secs(timeout);
+
+    let result = match (prompt, prompt_file) {
+        (Some(prompt), None) => {
+            GenerateSuccessOutput::Single(generate_single_prompt(&prompt, &out, timeout)?)
+        }
+        (None, Some(prompt_file)) => {
+            GenerateSuccessOutput::Batch(generate_prompt_batch(&prompt_file, &out, timeout)?)
+        }
+        _ => return Err(CliError::Unknown),
+    };
 
     if output.should_emit_stdout() {
         match output.effective_mode() {
             OutputMode::Json => {
                 let line =
-                    serde_json::to_string(&manifest).map_err(|_| CliError::OutputWriteFailed)?;
+                    serde_json::to_string(&result).map_err(|_| CliError::OutputWriteFailed)?;
                 println!("{line}");
             }
             OutputMode::Human => {
-                println!("{}", format_generate_result_human(&manifest, &out));
+                println!("{}", format_generate_result_human(&result, &out));
             }
         }
     }
@@ -348,7 +360,71 @@ fn generate(
     Ok(())
 }
 
-fn format_generate_result_human(manifest: &GenerationManifest, out_dir: &Path) -> String {
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum GenerateSuccessOutput {
+    Single(GenerationManifest),
+    Batch(BatchGenerationManifest),
+}
+
+fn generate_single_prompt(
+    prompt: &str,
+    out: &Path,
+    timeout: std::time::Duration,
+) -> Result<GenerationManifest, CliError> {
+    let generated =
+        generate_image_with_codex_with_options(prompt, out, CodexGenerationOptions { timeout })?;
+
+    write_generation_output_from_files(prompt, GPT_IMAGE_MODEL, out, &[generated.source_path])
+}
+
+fn generate_prompt_batch(
+    prompt_file: &Path,
+    out: &Path,
+    timeout: std::time::Duration,
+) -> Result<BatchGenerationManifest, CliError> {
+    let prompts = read_prompt_file_prompts(prompt_file)?;
+
+    remove_batch_manifest_if_exists(out)?;
+
+    let mut item_manifests = Vec::with_capacity(prompts.len());
+    for (index, prompt) in prompts.iter().enumerate() {
+        let item_out_dir = out.join(format!("item-{item_index:04}", item_index = index + 1));
+        let item_manifest = generate_single_prompt(prompt, &item_out_dir, timeout)?;
+        item_manifests.push(item_manifest);
+    }
+
+    write_batch_generation_manifest(prompt_file, GPT_IMAGE_MODEL, out, &item_manifests)
+}
+
+fn read_prompt_file_prompts(prompt_file: &Path) -> Result<Vec<String>, CliError> {
+    let raw = std::fs::read_to_string(prompt_file).map_err(|_| CliError::PromptFileReadFailed)?;
+    let prompts: Vec<String> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToOwned::to_owned)
+        .collect();
+
+    if prompts.is_empty() {
+        return Err(CliError::PromptFileEmpty);
+    }
+
+    Ok(prompts)
+}
+
+fn format_generate_result_human(result: &GenerateSuccessOutput, out_dir: &Path) -> String {
+    match result {
+        GenerateSuccessOutput::Single(manifest) => {
+            format_single_generate_result_human(manifest, out_dir)
+        }
+        GenerateSuccessOutput::Batch(manifest) => {
+            format_batch_generate_result_human(manifest, out_dir)
+        }
+    }
+}
+
+fn format_single_generate_result_human(manifest: &GenerationManifest, out_dir: &Path) -> String {
     let image_count = manifest.images.len();
     let mut lines = vec![
         format!(
@@ -367,6 +443,34 @@ fn format_generate_result_human(manifest: &GenerationManifest, out_dir: &Path) -
             path = image.path,
             byte_count = image.byte_count,
             format = image.format,
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn format_batch_generate_result_human(
+    manifest: &BatchGenerationManifest,
+    out_dir: &Path,
+) -> String {
+    let mut lines = vec![
+        format!(
+            "codex-image generated {} batch item{}",
+            manifest.item_count,
+            if manifest.item_count == 1 { "" } else { "s" }
+        ),
+        format!("model: {}", manifest.model),
+        format!("out: {}", out_dir.display()),
+        format!("manifest: {}", manifest.manifest_path),
+    ];
+
+    for item in &manifest.items {
+        lines.push(format!(
+            "item[{index}]: {out_dir} ({image_count} image artifact{plural})",
+            index = item.index,
+            out_dir = item.out_dir,
+            image_count = item.images.len(),
+            plural = if item.images.len() == 1 { "" } else { "s" }
         ));
     }
 
