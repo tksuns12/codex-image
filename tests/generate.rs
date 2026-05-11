@@ -777,7 +777,11 @@ fn generate_batch_failure_stops_on_second_item_and_removes_stale_root_manifest()
     assert_eq!(call_count, 2, "Codex should run exactly twice");
 
     let argv = fs::read_to_string(&argv_log).unwrap();
-    assert_eq!(argv.matches("CALL ").count(), 2, "argv log should show two runs");
+    assert_eq!(
+        argv.matches("CALL ").count(),
+        2,
+        "argv log should show two runs"
+    );
 
     let prompt_file_path = prompt_file.to_string_lossy().to_string();
     let out_dir_path = out_dir.to_string_lossy().to_string();
@@ -895,7 +899,10 @@ fn generate_batch_quiet_success_suppresses_stdout_but_writes_manifests() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stdout.is_empty(), "quiet success must suppress stdout");
+    assert!(
+        output.stdout.is_empty(),
+        "quiet success must suppress stdout"
+    );
     assert!(output.stderr.is_empty());
 
     assert!(out_dir.join("manifest.json").is_file());
@@ -942,7 +949,10 @@ fn generate_batch_output_json_with_quiet_suppresses_stdout_but_writes_manifests(
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.stdout.is_empty(), "quiet success must suppress stdout");
+    assert!(
+        output.stdout.is_empty(),
+        "quiet success must suppress stdout"
+    );
     assert!(output.stderr.is_empty());
 
     assert!(out_dir.join("manifest.json").is_file());
