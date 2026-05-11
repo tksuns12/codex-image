@@ -45,6 +45,10 @@ pub enum CliError {
     OutputWriteFailed,
     #[error("generated output verification failed")]
     OutputVerificationFailed,
+    #[error("prompt file read failed")]
+    PromptFileReadFailed,
+    #[error("prompt file contained no prompts")]
+    PromptFileEmpty,
     #[error("image generation response contract failure")]
     ImageGenerationResponseContract { source_message: String },
     #[error("Codex CLI is unavailable")]
@@ -133,6 +137,20 @@ impl CliError {
                 recoverable: true,
                 hint: "Ensure output paths are writable and retry.",
                 exit_code: ExitCode::Filesystem,
+            },
+            Self::PromptFileReadFailed => ErrorClassification {
+                code: "filesystem.prompt_file_read_failed",
+                message: "failed to read prompt file",
+                recoverable: true,
+                hint: "Ensure --prompt-file points to a readable UTF-8 text file and retry.",
+                exit_code: ExitCode::Filesystem,
+            },
+            Self::PromptFileEmpty => ErrorClassification {
+                code: "usage.prompt_file_empty",
+                message: "prompt file did not contain any prompts",
+                recoverable: true,
+                hint: "Add at least one non-empty, non-comment line to the prompt file and retry.",
+                exit_code: ExitCode::UsageOrConfig,
             },
             Self::ImageGenerationResponseContract { .. } => ErrorClassification {
                 code: "response_contract.image_generation",
