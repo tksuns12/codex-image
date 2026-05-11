@@ -236,12 +236,12 @@ trait WaitTimeout {
 
 impl WaitTimeout for std::process::Child {
     fn wait_timeout(&mut self, timeout: Duration) -> Result<std::process::ExitStatus, CliError> {
-        let deadline = Instant::now() + timeout;
+        let started_at = Instant::now();
         loop {
             match self.try_wait() {
                 Ok(Some(status)) => return Ok(status),
                 Ok(None) => {
-                    if Instant::now() >= deadline {
+                    if started_at.elapsed() >= timeout {
                         let _ = self.kill();
                         let _ = self.wait();
                         return Err(CliError::CodexImageGenerationFailed {
