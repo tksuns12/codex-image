@@ -139,7 +139,7 @@ fn write_batch_arg_recording_codex(
     first_source_image: &std::path::Path,
     second_source_image: &std::path::Path,
     argv_log: &std::path::Path,
-) -> std::path::PathBuf {
+) -> (std::path::PathBuf, std::path::PathBuf) {
     let script_path = temp.path().join("batch-arg-recording-codex");
     let counter_file = temp.path().join("batch-codex-counter");
     let script = format!(
@@ -199,7 +199,74 @@ printf '{{"image_path":"%s","note":"fake codex generated image"}}' "$image_path"
         permissions.set_mode(0o755);
         fs::set_permissions(&script_path, permissions).unwrap();
     }
-    script_path
+    (script_path, counter_file)
+}
+
+fn write_batch_second_fail_codex(
+    temp: &TempDir,
+    first_source_image: &std::path::Path,
+    argv_log: &std::path::Path,
+    stderr_sentinel: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let script_path = temp.path().join("batch-second-fail-codex");
+    let counter_file = temp.path().join("batch-second-fail-counter");
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set -eu
+last_message=""
+counter_file="{counter_file}"
+if [ ! -f "$counter_file" ]; then
+  printf '0' > "$counter_file"
+fi
+call_count=$(cat "$counter_file")
+call_count=$((call_count + 1))
+printf '%s' "$call_count" > "$counter_file"
+
+printf 'CALL %s\n' "$call_count" >> "{argv_log}"
+for arg in "$@"; do
+  printf '%s\n' "$arg" >> "{argv_log}"
+done
+printf -- '---\n' >> "{argv_log}"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output-last-message)
+      shift
+      last_message="$1"
+      ;;
+  esac
+  shift || true
+done
+if [ -z "$last_message" ]; then
+  exit 41
+fi
+
+if [ "$call_count" -eq 2 ]; then
+  printf 'Bearer token %s\n' "{stderr_sentinel}" >&2
+  printf 'prompt-second: second prompt secret\n' >&2
+  printf 'path-second: /tmp/sensitive/path.txt\n' >&2
+  exit 42
+fi
+
+if [ "$call_count" -gt 2 ]; then
+  exit 43
+fi
+
+printf '{{"image_path":"{first_source_image}","note":"fake codex generated image"}}' > "$last_message"
+"#,
+        counter_file = counter_file.display(),
+        argv_log = argv_log.display(),
+        first_source_image = first_source_image.display(),
+        stderr_sentinel = stderr_sentinel,
+    );
+    fs::write(&script_path, script).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+    }
+    (script_path, counter_file)
 }
 
 fn count_last_message_artifacts(out_dir: &std::path::Path) -> usize {
@@ -551,7 +618,7 @@ fn generate_batch_success_from_prompt_file_writes_item_outputs_and_root_json_con
     fs::write(&second_source_image, b"second-image-bytes").unwrap();
 
     let argv_log = temp.path().join("batch-codex-argv.log");
-    let fake_codex = write_batch_arg_recording_codex(
+    let (fake_codex, _counter_file) = write_batch_arg_recording_codex(
         &temp,
         &first_source_image,
         &second_source_image,
@@ -637,6 +704,250 @@ fn generate_batch_success_from_prompt_file_writes_item_outputs_and_root_json_con
         !argv_tokens.iter().any(|arg| *arg == "7"),
         "timeout value must not be forwarded to Codex subprocess"
     );
+}
+
+#[test]
+fn generate_batch_failure_stops_on_second_item_and_removes_stale_root_manifest() {
+    let temp = TempDir::new().unwrap();
+    let first_source_image = temp.path().join("codex-source-one.png");
+    fs::write(&first_source_image, b"first-image-bytes").unwrap();
+
+    let argv_log = temp.path().join("batch-second-fail-argv.log");
+    let token_sentinel = "sk-batch-fail-fixture-12345";
+    let (fake_codex, counter_file) =
+        write_batch_second_fail_codex(&temp, &first_source_image, &argv_log, token_sentinel);
+
+    let prompt_file = temp.path().join("prompts.txt");
+    fs::write(&prompt_file, "first prompt\nsecond prompt\nthird prompt\n").unwrap();
+
+    let out_dir = temp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    fs::write(out_dir.join("manifest.json"), "{\"stale\":true}").unwrap();
+
+    let output = Command::cargo_bin("codex-image")
+        .unwrap()
+        .arg("generate")
+        .arg("--prompt-file")
+        .arg(&prompt_file)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--output")
+        .arg("json")
+        .env("CODEX_IMAGE_CODEX_BIN", &fake_codex)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "second-item Codex failure should map to API exit code"
+    );
+    assert!(output.stdout.is_empty(), "failure stdout must stay empty");
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr.trim_end().lines().count(),
+        1,
+        "failure stderr should be one diagnostics envelope"
+    );
+    let envelope: Value = serde_json::from_str(stderr.trim_end()).unwrap();
+    assert_eq!(
+        envelope["error"]["code"],
+        "api.codex_image_generation_failed"
+    );
+
+    assert!(
+        !out_dir.join("manifest.json").exists(),
+        "stale root manifest must be removed and not rewritten on partial failure"
+    );
+    assert!(
+        out_dir.join("item-0001").join("manifest.json").is_file(),
+        "first item artifacts should remain"
+    );
+    assert!(
+        !out_dir.join("item-0003").exists(),
+        "batch must stop after second-item failure"
+    );
+
+    let call_count: usize = fs::read_to_string(&counter_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(call_count, 2, "Codex should run exactly twice");
+
+    let argv = fs::read_to_string(&argv_log).unwrap();
+    assert_eq!(argv.matches("CALL ").count(), 2, "argv log should show two runs");
+
+    let prompt_file_path = prompt_file.to_string_lossy().to_string();
+    let out_dir_path = out_dir.to_string_lossy().to_string();
+    for forbidden in [
+        "second prompt",
+        token_sentinel,
+        "/tmp/sensitive/path.txt",
+        "Bearer",
+        prompt_file_path.as_str(),
+        out_dir_path.as_str(),
+    ] {
+        assert!(
+            !stderr.contains(forbidden),
+            "stderr leaked forbidden batch failure data: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn generate_batch_defaults_to_human_success_output() {
+    let temp = TempDir::new().unwrap();
+    let first_source_image = temp.path().join("codex-source-one.png");
+    let second_source_image = temp.path().join("codex-source-two.png");
+    fs::write(&first_source_image, b"first-image-bytes").unwrap();
+    fs::write(&second_source_image, b"second-image-bytes").unwrap();
+
+    let argv_log = temp.path().join("batch-human-argv.log");
+    let (fake_codex, _counter_file) = write_batch_arg_recording_codex(
+        &temp,
+        &first_source_image,
+        &second_source_image,
+        &argv_log,
+    );
+
+    let prompt_file = temp.path().join("prompts.txt");
+    fs::write(&prompt_file, "first prompt\nsecond prompt\n").unwrap();
+
+    let out_dir = temp.path().join("out");
+    let output = Command::cargo_bin("codex-image")
+        .unwrap()
+        .arg("generate")
+        .arg("--prompt-file")
+        .arg(&prompt_file)
+        .arg("--out")
+        .arg(&out_dir)
+        .env("CODEX_IMAGE_CODEX_BIN", &fake_codex)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let trimmed = stdout.trim_end();
+    assert!(!trimmed.is_empty(), "human output should not be empty");
+    assert!(
+        !trimmed.trim_start().starts_with('{'),
+        "batch default output should be human-readable"
+    );
+
+    let root_manifest = out_dir.join("manifest.json");
+    let item_one_manifest = out_dir.join("item-0001").join("manifest.json");
+    let item_two_manifest = out_dir.join("item-0002").join("manifest.json");
+    let item_one_manifest_path = item_one_manifest.to_string_lossy().to_string();
+    let item_two_manifest_path = item_two_manifest.to_string_lossy().to_string();
+
+    assert!(trimmed.contains("codex-image generated 2 batch items"));
+    assert!(trimmed.contains(&format!("manifest: {}", root_manifest.display())));
+    assert!(trimmed.contains(&item_one_manifest_path));
+    assert!(trimmed.contains(&item_two_manifest_path));
+
+    assert!(root_manifest.is_file());
+    assert!(item_one_manifest.is_file());
+    assert!(item_two_manifest.is_file());
+}
+
+#[test]
+fn generate_batch_quiet_success_suppresses_stdout_but_writes_manifests() {
+    let temp = TempDir::new().unwrap();
+    let first_source_image = temp.path().join("codex-source-one.png");
+    let second_source_image = temp.path().join("codex-source-two.png");
+    fs::write(&first_source_image, b"first-image-bytes").unwrap();
+    fs::write(&second_source_image, b"second-image-bytes").unwrap();
+
+    let argv_log = temp.path().join("batch-quiet-argv.log");
+    let (fake_codex, _counter_file) = write_batch_arg_recording_codex(
+        &temp,
+        &first_source_image,
+        &second_source_image,
+        &argv_log,
+    );
+
+    let prompt_file = temp.path().join("prompts.txt");
+    fs::write(&prompt_file, "first prompt\nsecond prompt\n").unwrap();
+
+    let out_dir = temp.path().join("out");
+    let output = Command::cargo_bin("codex-image")
+        .unwrap()
+        .arg("generate")
+        .arg("--prompt-file")
+        .arg(&prompt_file)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--quiet")
+        .env("CODEX_IMAGE_CODEX_BIN", &fake_codex)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty(), "quiet success must suppress stdout");
+    assert!(output.stderr.is_empty());
+
+    assert!(out_dir.join("manifest.json").is_file());
+    assert!(out_dir.join("item-0001").join("manifest.json").is_file());
+    assert!(out_dir.join("item-0002").join("manifest.json").is_file());
+}
+
+#[test]
+fn generate_batch_output_json_with_quiet_suppresses_stdout_but_writes_manifests() {
+    let temp = TempDir::new().unwrap();
+    let first_source_image = temp.path().join("codex-source-one.png");
+    let second_source_image = temp.path().join("codex-source-two.png");
+    fs::write(&first_source_image, b"first-image-bytes").unwrap();
+    fs::write(&second_source_image, b"second-image-bytes").unwrap();
+
+    let argv_log = temp.path().join("batch-json-quiet-argv.log");
+    let (fake_codex, _counter_file) = write_batch_arg_recording_codex(
+        &temp,
+        &first_source_image,
+        &second_source_image,
+        &argv_log,
+    );
+
+    let prompt_file = temp.path().join("prompts.txt");
+    fs::write(&prompt_file, "first prompt\nsecond prompt\n").unwrap();
+
+    let out_dir = temp.path().join("out");
+    let output = Command::cargo_bin("codex-image")
+        .unwrap()
+        .arg("generate")
+        .arg("--prompt-file")
+        .arg(&prompt_file)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--output")
+        .arg("json")
+        .arg("--quiet")
+        .env("CODEX_IMAGE_CODEX_BIN", &fake_codex)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty(), "quiet success must suppress stdout");
+    assert!(output.stderr.is_empty());
+
+    assert!(out_dir.join("manifest.json").is_file());
+    assert!(out_dir.join("item-0001").join("manifest.json").is_file());
+    assert!(out_dir.join("item-0002").join("manifest.json").is_file());
 }
 
 #[test]
