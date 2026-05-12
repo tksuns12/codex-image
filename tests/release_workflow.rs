@@ -97,6 +97,44 @@ fn release_workflow_builds_expected_platform_artifacts() {
 }
 
 #[test]
+fn release_workflow_publishes_aggregate_sha256sums() {
+    let workflow = include_str!("../.github/workflows/release.yml");
+
+    assert!(
+        workflow.contains("actions/upload-artifact@v4"),
+        "matrix builds must upload archives as workflow artifacts for aggregation"
+    );
+    assert!(
+        workflow.contains("actions/download-artifact@v4"),
+        "publish job must download all matrix artifacts before checksumming"
+    );
+    assert!(
+        workflow.contains("pattern: release-archive-*")
+            && workflow.contains("merge-multiple: true"),
+        "publish job must merge release archive artifacts into one directory"
+    );
+    assert!(
+        workflow.contains("name: Publish release assets")
+            && workflow.contains("needs: [release-please, build-artifacts]"),
+        "release assets must be published only after every matrix archive is built"
+    );
+    assert!(
+        workflow.contains("Generate aggregate SHA256SUMS")
+            && workflow.contains("sha256sum \"${archives[@]}\" > SHA256SUMS"),
+        "publish job must compute one aggregate SHA256SUMS file from all archives"
+    );
+    assert!(
+        workflow.contains("LC_ALL=C sort"),
+        "SHA256SUMS generation must be deterministic across reruns"
+    );
+    assert!(
+        workflow
+            .contains("gh release upload \"$RELEASE_TAG\" \"${archives[@]}\" SHA256SUMS --clobber"),
+        "publish job must upload archives and SHA256SUMS to the GitHub Release with --clobber"
+    );
+}
+
+#[test]
 fn release_workflow_targets_have_updater_mapping_and_naming_contract() {
     let workflow = include_str!("../.github/workflows/release.yml");
     let workflow_targets = workflow_matrix_targets(workflow);
