@@ -1149,6 +1149,402 @@ fn generate_debug_diagnostics_timeout_failure_writes_redacted_sidecar() {
 }
 
 #[test]
+fn generate_debug_diagnostics_batch_success_writes_progress_runs_and_sanitizes_sidecar() {
+    let temp = TempDir::new().unwrap();
+    let first_source_image = temp.path().join("codex-source-one.png");
+    let second_source_image = temp.path().join("codex-source-two.png");
+    fs::write(&first_source_image, b"first-image-bytes").unwrap();
+    fs::write(&second_source_image, b"second-image-bytes").unwrap();
+
+    let argv_log = temp.path().join("batch-diagnostics-success-argv.log");
+    let (fake_codex, _counter_file) = write_batch_arg_recording_codex(
+        &temp,
+        &first_source_image,
+        &second_source_image,
+        &argv_log,
+    );
+
+    let prompt_file = temp.path().join("prompts.txt");
+    fs::write(
+        &prompt_file,
+        "first prompt Bearer sk-batch-success b64_json\nsecond prompt secret\n",
+    )
+    .unwrap();
+
+    let out_dir = temp.path().join("out");
+    let diagnostics_path = temp.path().join("nested").join("batch-diagnostics.json");
+    let output = Command::cargo_bin("codex-image")
+        .unwrap()
+        .arg("generate")
+        .arg("--prompt-file")
+        .arg(&prompt_file)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--output")
+        .arg("json")
+        .arg("--timeout")
+        .arg("7")
+        .arg("--debug-diagnostics")
+        .arg(&diagnostics_path)
+        .env("CODEX_IMAGE_CODEX_BIN", &fake_codex)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stdout_manifest: Value = serde_json::from_str(stdout.trim_end()).unwrap();
+    assert_eq!(stdout_manifest["mode"], "batch");
+    assert_eq!(stdout_manifest["item_count"], 2);
+    assert!(out_dir.join("manifest.json").is_file());
+
+    let rendered = fs::read_to_string(&diagnostics_path).unwrap();
+    let diagnostics: Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(diagnostics["schema"], "codex-image.generation-diagnostics");
+    assert_eq!(diagnostics["schema_version"], 1);
+    assert_eq!(diagnostics["metadata"]["mode"], "batch");
+    assert_eq!(diagnostics["metadata"]["result"], "success");
+    assert_eq!(diagnostics["metadata"]["prompt_source"], "prompt_file");
+    assert_eq!(diagnostics["metadata"]["stdout_mode"], "json");
+    assert_eq!(diagnostics["metadata"]["timeout_seconds"], 7);
+    assert!(diagnostics.get("failure").is_none());
+    assert_eq!(diagnostics["batch"]["planned_items"], 2);
+    assert_eq!(diagnostics["batch"]["completed_items"], 2);
+    assert_eq!(diagnostics["batch"]["failed_item_index"], Value::Null);
+
+    let runs = diagnostics["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2);
+    for (zero_based, run) in runs.iter().enumerate() {
+        let expected_index = zero_based + 1;
+        assert_eq!(run["index"], expected_index);
+        assert_eq!(run["item_index"], expected_index);
+        assert_eq!(run["phase"], "generate_image");
+        assert_eq!(run["outcome"], "succeeded");
+        assert_eq!(run["status"], "succeeded");
+        assert_eq!(run["timeout_seconds"], 7);
+        assert_eq!(run["timed_out"], false);
+        assert_eq!(run["exit_code"], 0);
+        assert_eq!(run["final_message"]["status"], "parsed");
+        assert!(run.get("failure").is_none());
+    }
+
+    let temp_path = temp.path().to_string_lossy().to_string();
+    let prompt_file_path = prompt_file.to_string_lossy().to_string();
+    let out_path = out_dir.to_string_lossy().to_string();
+    let diagnostics_file_path = diagnostics_path.to_string_lossy().to_string();
+    let fake_codex_path = fake_codex.to_string_lossy().to_string();
+    let first_source_path = first_source_image.to_string_lossy().to_string();
+    let second_source_path = second_source_image.to_string_lossy().to_string();
+    assert_debug_diagnostics_omits(
+        &rendered,
+        &[
+            "first prompt",
+            "second prompt",
+            "Bearer",
+            "sk-batch-success",
+            "b64_json",
+            "CODEX_IMAGE_CODEX_BIN",
+            temp_path.as_str(),
+            prompt_file_path.as_str(),
+            out_path.as_str(),
+            diagnostics_file_path.as_str(),
+            fake_codex_path.as_str(),
+            first_source_path.as_str(),
+            second_source_path.as_str(),
+            ".codex-image-last-message-",
+            "image_path\":\"",
+            "note\":\"",
+        ],
+    );
+}
+
+#[test]
+fn generate_debug_diagnostics_batch_failure_reports_partial_progress_and_redacts_sidecar() {
+    let temp = TempDir::new().unwrap();
+    let first_source_image = temp.path().join("codex-source-one.png");
+    fs::write(&first_source_image, b"first-image-bytes").unwrap();
+
+    let argv_log = temp.path().join("batch-diagnostics-failure-argv.log");
+    let token_sentinel = "sk-batch-diagnostics-fail-fixture-12345";
+    let (fake_codex, counter_file) =
+        write_batch_second_fail_codex(&temp, &first_source_image, &argv_log, token_sentinel);
+
+    let prompt_file = temp.path().join("prompts.txt");
+    fs::write(
+        &prompt_file,
+        "first prompt\nsecond prompt secret\nthird prompt\n",
+    )
+    .unwrap();
+
+    let out_dir = temp.path().join("out");
+    fs::create_dir_all(&out_dir).unwrap();
+    fs::write(out_dir.join("manifest.json"), "{\"stale\":true}").unwrap();
+    let diagnostics_path = temp.path().join("batch-failure-diagnostics.json");
+
+    let output = Command::cargo_bin("codex-image")
+        .unwrap()
+        .arg("generate")
+        .arg("--prompt-file")
+        .arg(&prompt_file)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--output")
+        .arg("json")
+        .arg("--debug-diagnostics")
+        .arg(&diagnostics_path)
+        .env("CODEX_IMAGE_CODEX_BIN", &fake_codex)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(4));
+    assert!(output.stdout.is_empty(), "failure stdout must stay empty");
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let envelope: Value = serde_json::from_str(stderr.trim_end()).unwrap();
+    assert_eq!(
+        envelope["error"]["code"],
+        "api.codex_image_generation_failed"
+    );
+    assert!(
+        !out_dir.join("manifest.json").exists(),
+        "stale root manifest must be removed and not rewritten on partial failure"
+    );
+    assert!(out_dir.join("item-0001").join("manifest.json").is_file());
+    assert!(
+        !out_dir.join("item-0003").exists(),
+        "batch must stop before the third item"
+    );
+
+    let call_count: usize = fs::read_to_string(&counter_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(call_count, 2, "Codex should run exactly twice");
+
+    let rendered = fs::read_to_string(&diagnostics_path).unwrap();
+    let diagnostics: Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(diagnostics["metadata"]["mode"], "batch");
+    assert_eq!(diagnostics["metadata"]["result"], "failure");
+    assert_eq!(diagnostics["metadata"]["prompt_source"], "prompt_file");
+    assert_eq!(diagnostics["metadata"]["stdout_mode"], "json");
+    assert_eq!(
+        diagnostics["failure"]["code"],
+        "api.codex_image_generation_failed"
+    );
+    assert_eq!(diagnostics["batch"]["planned_items"], 3);
+    assert_eq!(diagnostics["batch"]["completed_items"], 1);
+    assert_eq!(diagnostics["batch"]["failed_item_index"], 2);
+
+    let runs = diagnostics["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 2, "third item must not produce a run entry");
+    assert_eq!(runs[0]["index"], 1);
+    assert_eq!(runs[0]["item_index"], 1);
+    assert_eq!(runs[0]["status"], "succeeded");
+    assert_eq!(runs[1]["index"], 2);
+    assert_eq!(runs[1]["item_index"], 2);
+    assert_eq!(runs[1]["outcome"], "failed");
+    assert_eq!(runs[1]["status"], "failed");
+    assert_eq!(runs[1]["final_message"]["status"], "not_observed");
+    assert_eq!(
+        runs[1]["failure"]["code"],
+        "api.codex_image_generation_failed"
+    );
+
+    let prompt_file_path = prompt_file.to_string_lossy().to_string();
+    let out_dir_path = out_dir.to_string_lossy().to_string();
+    let diagnostics_file_path = diagnostics_path.to_string_lossy().to_string();
+    let fake_codex_path = fake_codex.to_string_lossy().to_string();
+    let first_source_path = first_source_image.to_string_lossy().to_string();
+    assert_debug_diagnostics_omits(
+        &rendered,
+        &[
+            "first prompt",
+            "second prompt secret",
+            "third prompt",
+            token_sentinel,
+            "/tmp/sensitive/path.txt",
+            "Bearer",
+            "CODEX_IMAGE_CODEX_BIN",
+            prompt_file_path.as_str(),
+            out_dir_path.as_str(),
+            diagnostics_file_path.as_str(),
+            fake_codex_path.as_str(),
+            first_source_path.as_str(),
+            ".codex-image-last-message-",
+            "image_path\":\"",
+            "note\":\"",
+        ],
+    );
+    for forbidden in [
+        "second prompt secret",
+        token_sentinel,
+        "/tmp/sensitive/path.txt",
+        "Bearer",
+        prompt_file_path.as_str(),
+        out_dir_path.as_str(),
+    ] {
+        assert!(
+            !stderr.contains(forbidden),
+            "stderr leaked forbidden batch failure data: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn generate_debug_diagnostics_batch_prompt_file_failures_write_zero_run_sidecars() {
+    let temp = TempDir::new().unwrap();
+    let missing_prompt_file = temp.path().join("missing-prompts.txt");
+    let empty_prompt_file = temp.path().join("empty-prompts.txt");
+    fs::write(&empty_prompt_file, "\n# comment only\n   \n").unwrap();
+
+    let cases = [
+        (
+            "missing",
+            missing_prompt_file,
+            5,
+            "filesystem.prompt_file_read_failed",
+        ),
+        ("empty", empty_prompt_file, 2, "usage.prompt_file_empty"),
+    ];
+
+    for (label, prompt_file, expected_exit, expected_error_code) in cases {
+        let out_dir = temp.path().join(format!("out-{label}"));
+        let diagnostics_path = temp.path().join(format!("diagnostics-{label}.json"));
+
+        let output = Command::cargo_bin("codex-image")
+            .unwrap()
+            .arg("generate")
+            .arg("--prompt-file")
+            .arg(&prompt_file)
+            .arg("--out")
+            .arg(&out_dir)
+            .arg("--output")
+            .arg("json")
+            .arg("--debug-diagnostics")
+            .arg(&diagnostics_path)
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(expected_exit), "case {label}");
+        assert!(output.stdout.is_empty(), "case {label}");
+
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let envelope: Value = serde_json::from_str(stderr.trim_end()).unwrap();
+        assert_eq!(
+            envelope["error"]["code"], expected_error_code,
+            "case {label}"
+        );
+
+        let rendered = fs::read_to_string(&diagnostics_path).unwrap();
+        let diagnostics: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(diagnostics["metadata"]["mode"], "batch", "case {label}");
+        assert_eq!(diagnostics["metadata"]["result"], "failure", "case {label}");
+        assert_eq!(
+            diagnostics["metadata"]["prompt_source"], "prompt_file",
+            "case {label}"
+        );
+        assert_eq!(
+            diagnostics["failure"]["code"], expected_error_code,
+            "case {label}"
+        );
+        assert_eq!(diagnostics["batch"]["planned_items"], 0, "case {label}");
+        assert_eq!(diagnostics["batch"]["completed_items"], 0, "case {label}");
+        assert_eq!(
+            diagnostics["batch"]["failed_item_index"],
+            Value::Null,
+            "case {label}"
+        );
+        assert!(
+            diagnostics["runs"].as_array().unwrap().is_empty(),
+            "case {label}"
+        );
+
+        let prompt_file_path = prompt_file.to_string_lossy().to_string();
+        let out_path = out_dir.to_string_lossy().to_string();
+        let diagnostics_file_path = diagnostics_path.to_string_lossy().to_string();
+        assert_debug_diagnostics_omits(
+            &rendered,
+            &[
+                "comment only",
+                prompt_file_path.as_str(),
+                out_path.as_str(),
+                diagnostics_file_path.as_str(),
+                temp.path().to_string_lossy().as_ref(),
+            ],
+        );
+        for forbidden in ["comment only", prompt_file_path.as_str(), out_path.as_str()] {
+            assert!(
+                !stderr.contains(forbidden),
+                "stderr leaked forbidden prompt-file failure data: {forbidden}"
+            );
+        }
+    }
+}
+
+#[test]
+fn generate_debug_diagnostics_batch_quiet_success_records_quiet_without_stdout() {
+    let temp = TempDir::new().unwrap();
+    let first_source_image = temp.path().join("codex-source-one.png");
+    let second_source_image = temp.path().join("codex-source-two.png");
+    fs::write(&first_source_image, b"first-image-bytes").unwrap();
+    fs::write(&second_source_image, b"second-image-bytes").unwrap();
+
+    let argv_log = temp.path().join("batch-diagnostics-quiet-argv.log");
+    let (fake_codex, _counter_file) = write_batch_arg_recording_codex(
+        &temp,
+        &first_source_image,
+        &second_source_image,
+        &argv_log,
+    );
+
+    let prompt_file = temp.path().join("prompts.txt");
+    fs::write(&prompt_file, "first prompt\nsecond prompt\n").unwrap();
+    let out_dir = temp.path().join("out");
+    let diagnostics_path = temp.path().join("quiet-batch-diagnostics.json");
+
+    let output = Command::cargo_bin("codex-image")
+        .unwrap()
+        .arg("generate")
+        .arg("--prompt-file")
+        .arg(&prompt_file)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--quiet")
+        .arg("--debug-diagnostics")
+        .arg(&diagnostics_path)
+        .env("CODEX_IMAGE_CODEX_BIN", &fake_codex)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "quiet success must suppress stdout"
+    );
+    assert!(output.stderr.is_empty());
+    assert!(out_dir.join("manifest.json").is_file());
+
+    let rendered = fs::read_to_string(&diagnostics_path).unwrap();
+    let diagnostics: Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(diagnostics["metadata"]["mode"], "batch");
+    assert_eq!(diagnostics["metadata"]["result"], "success");
+    assert_eq!(diagnostics["metadata"]["stdout_mode"], "quiet");
+    assert_eq!(diagnostics["batch"]["planned_items"], 2);
+    assert_eq!(diagnostics["batch"]["completed_items"], 2);
+    assert_eq!(diagnostics["runs"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn generate_timeout_is_local_only_and_not_forwarded_to_codex_subprocess() {
     let temp = TempDir::new().unwrap();
     let source_image = temp.path().join("codex-source.png");

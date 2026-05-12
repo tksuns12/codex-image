@@ -533,14 +533,15 @@ fn generate_prompt_batch(
     timeout: std::time::Duration,
     diagnostics: Option<&CodexDiagnosticsRecorder>,
 ) -> Result<(BatchGenerationManifest, BatchDiagnosticsSummary), BatchGenerationFailure> {
-    let prompts = read_prompt_file_prompts(prompt_file).map_err(|error| BatchGenerationFailure {
-        error,
-        summary: BatchDiagnosticsSummary {
-            planned_items: 0,
-            completed_items: 0,
-            failed_item_index: None,
-        },
-    })?;
+    let prompts =
+        read_prompt_file_prompts(prompt_file).map_err(|error| BatchGenerationFailure {
+            error,
+            summary: BatchDiagnosticsSummary {
+                planned_items: 0,
+                completed_items: 0,
+                failed_item_index: None,
+            },
+        })?;
 
     let mut summary = BatchDiagnosticsSummary {
         planned_items: prompts.len(),
@@ -548,7 +549,8 @@ fn generate_prompt_batch(
         failed_item_index: None,
     };
 
-    remove_batch_manifest_if_exists(out).map_err(|error| BatchGenerationFailure { error, summary })?;
+    remove_batch_manifest_if_exists(out)
+        .map_err(|error| BatchGenerationFailure { error, summary })?;
 
     let mut item_manifests = Vec::with_capacity(prompts.len());
     for (index, prompt) in prompts.iter().enumerate() {
@@ -568,8 +570,9 @@ fn generate_prompt_batch(
         }
     }
 
-    let manifest = write_batch_generation_manifest(prompt_file, GPT_IMAGE_MODEL, out, &item_manifests)
-        .map_err(|error| BatchGenerationFailure { error, summary })?;
+    let manifest =
+        write_batch_generation_manifest(prompt_file, GPT_IMAGE_MODEL, out, &item_manifests)
+            .map_err(|error| BatchGenerationFailure { error, summary })?;
 
     Ok((manifest, summary))
 }
