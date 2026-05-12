@@ -29,7 +29,7 @@ Recommended path: install from a release artifact for your platform.
 
 ### From a release artifact
 
-Download and run the installer script for your platform. Each script resolves the newest GitHub Release tag automatically, downloads the matching archive, installs the binary, and verifies `codex-image --help`.
+Download and run the installer script for your platform. Each script resolves the newest GitHub Release tag automatically, verifies the downloaded archive against `SHA256SUMS`, installs the binary, and verifies `codex-image --help`.
 
 #### Linux x86_64 / macOS x86_64 / macOS arm64
 
@@ -67,29 +67,15 @@ codex-image generate "A watercolor fox reading in a library" --out ./out
 Expected output from that single command:
 - an image file named `image-0001.<format>` in `./out`
 - `manifest.json` in `./out`
-- the same manifest JSON printed to stdout
+- a human-readable success line on stdout (default behavior)
 
-Example stdout shape:
+`manifest.json` is always written under `--out`. If your automation needs machine-readable manifest stdout, rerun with `--output json`:
 
-```json
-{
-  "prompt": "A watercolor fox reading in a library",
-  "model": "gpt-image-2",
-  "manifest_path": "./out/manifest.json",
-  "images": [
-    {
-      "index": 1,
-      "path": "./out/image-0001.png",
-      "format": "png",
-      "byte_count": 12345
-    }
-  ],
-  "response": {
-    "created": 1777523488,
-    "usage": {}
-  }
-}
+```bash
+codex-image generate "A watercolor fox reading in a library" --out ./out --output json
 ```
+
+Use `--quiet` when your caller checks files and exit status separately and does not need success stdout text.
 
 ## After your first run
 
@@ -109,11 +95,13 @@ If your first run succeeded, use these references for operations beyond quicksta
 Fast command reference:
 
 ```bash
+codex-image generate "A watercolor fox reading in a library" --out ./out --quiet
+codex-image generate --prompt-file ./prompt.txt --out ./out --timeout 120 --debug-diagnostics
 codex-image skill install --tool codex --scope project --yes
 codex-image skill update --tool codex --scope project --yes
-codex-image update --dry-run
+codex-image update --dry-run --output json
 codex-image update
 codex-image update --version v1.2.3
 ```
 
-Keep using explicit `--tool` and `--scope` values for skill automation. Use `codex-image update --dry-run` before replacement when you want a non-mutating preview.
+Keep using explicit `--tool` and `--scope` values for skill automation. Use `--output json` when a caller needs machine-readable stdout, and use `codex-image update --dry-run --output json` before replacement when you want a non-mutating JSON preview.
