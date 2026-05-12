@@ -1,9 +1,10 @@
 use std::fs;
+use std::time::{Duration, SystemTime};
 
 use codex_image::diagnostics::CliError;
 use codex_image::output::{
     remove_batch_manifest_if_exists, write_batch_generation_manifest,
-    write_generation_output_from_files,
+    write_generation_output_from_files, write_generation_output_from_sources, GeneratedImageSource,
 };
 use tempfile::{tempdir, NamedTempFile};
 
@@ -113,6 +114,41 @@ fn output_manifest_redacts_source_path_and_token_sentinels() {
             "serialized contract should not contain {forbidden}"
         );
     }
+}
+
+#[test]
+fn output_rejects_trusted_source_modified_before_not_before_without_copying() {
+    let temp = tempdir().expect("tempdir should create");
+    let source = temp.path().join("stale-source.png");
+    fs::write(&source, b"stale-bytes").unwrap();
+    let out_dir = temp.path().join("images");
+    let trusted_source =
+        GeneratedImageSource::trusted_after(source, SystemTime::now() + Duration::from_secs(60));
+
+    let err = write_generation_output_from_sources(
+        "prompt secret",
+        "gpt-image-2",
+        &out_dir,
+        &[trusted_source],
+    )
+    .expect_err("trusted source older than not_before must fail");
+
+    assert!(matches!(
+        err,
+        CliError::ImageGenerationResponseContract { .. }
+    ));
+    assert_eq!(
+        err.error_envelope().error.code,
+        "response_contract.image_generation"
+    );
+    assert!(
+        !out_dir.join("manifest.json").exists(),
+        "failed freshness validation must not write manifest"
+    );
+    assert!(
+        !out_dir.join("image-0001.png").exists(),
+        "failed freshness validation must not copy image"
+    );
 }
 
 #[test]

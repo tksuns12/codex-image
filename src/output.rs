@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use chrono::Utc;
 use serde::Serialize;
@@ -9,6 +10,28 @@ use crate::diagnostics::CliError;
 
 const DEFAULT_IMAGE_FORMAT: &str = "png";
 const MANIFEST_FILE: &str = "manifest.json";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedImageSource {
+    pub path: PathBuf,
+    pub not_before: Option<SystemTime>,
+}
+
+impl GeneratedImageSource {
+    pub fn unchecked(path: PathBuf) -> Self {
+        Self {
+            path,
+            not_before: None,
+        }
+    }
+
+    pub fn trusted_after(path: PathBuf, not_before: SystemTime) -> Self {
+        Self {
+            path,
+            not_before: Some(not_before),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct GenerationManifest {
@@ -69,6 +92,21 @@ pub fn write_generation_output_from_files(
     out_dir: &Path,
     source_paths: &[PathBuf],
 ) -> Result<GenerationManifest, CliError> {
+    let sources: Vec<GeneratedImageSource> = source_paths
+        .iter()
+        .cloned()
+        .map(GeneratedImageSource::unchecked)
+        .collect();
+
+    write_generation_output_from_sources(prompt, model, out_dir, &sources)
+}
+
+pub fn write_generation_output_from_sources(
+    prompt: &str,
+    model: &str,
+    out_dir: &Path,
+    source_paths: &[GeneratedImageSource],
+) -> Result<GenerationManifest, CliError> {
     if source_paths.is_empty() {
         return Err(CliError::ImageGenerationResponseContract {
             source_message: "Codex image generation response missing image path".to_string(),
@@ -79,11 +117,23 @@ pub fn write_generation_output_from_files(
 
     let mut images = Vec::with_capacity(source_paths.len());
 
-    for (idx, source_path) in source_paths.iter().enumerate() {
-        if !source_path.is_file() {
+    for (idx, source) in source_paths.iter().enumerate() {
+        let source_path = &source.path;
+        let metadata =
+            source_path
+                .metadata()
+                .map_err(|_| CliError::ImageGenerationResponseContract {
+                    source_message: "Codex image generation source path missing".to_string(),
+                })?;
+
+        if !metadata.is_file() {
             return Err(CliError::ImageGenerationResponseContract {
                 source_message: "Codex image generation source path missing".to_string(),
             });
+        }
+
+        if let Some(not_before) = source.not_before {
+            validate_source_freshness(&metadata, not_before)?;
         }
 
         let format = source_path
@@ -208,6 +258,26 @@ pub fn remove_batch_manifest_if_exists(out_dir: &Path) -> Result<(), CliError> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(CliError::OutputWriteFailed),
     }
+}
+
+fn validate_source_freshness(
+    metadata: &fs::Metadata,
+    not_before: SystemTime,
+) -> Result<(), CliError> {
+    let modified = metadata
+        .modified()
+        .map_err(|_| CliError::ImageGenerationResponseContract {
+            source_message: "Codex image generation source path metadata unavailable".to_string(),
+        })?;
+
+    if modified < not_before {
+        return Err(CliError::ImageGenerationResponseContract {
+            source_message: "Codex image generation source path predates current invocation"
+                .to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {

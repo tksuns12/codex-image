@@ -1,7 +1,7 @@
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -26,8 +26,10 @@ done
 if [ -z "$last_message" ]; then
   exit 41
 fi
+touch "{}"
 printf '{{"image_path":"{}","note":"fake codex generated image"}}' > "$last_message"
 "#,
+        source_image.display(),
         source_image.display()
     );
     fs::write(&script_path, script).unwrap();
@@ -54,6 +56,60 @@ fn write_failing_codex(temp: &TempDir) -> std::path::PathBuf {
         fs::set_permissions(&script_path, permissions).unwrap();
     }
     script_path
+}
+
+fn write_untrusted_path_codex(
+    temp: &TempDir,
+    source_image: &std::path::Path,
+) -> std::path::PathBuf {
+    let script_path = temp.path().join("untrusted-path-codex");
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set -eu
+last_message=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --output-last-message)
+      shift
+      last_message="$1"
+      ;;
+  esac
+  shift || true
+done
+if [ -z "$last_message" ]; then
+  exit 41
+fi
+printf '{{"image_path":"{}","note":"Bearer stale source should not leak"}}' > "$last_message"
+"#,
+        source_image.display()
+    );
+    fs::write(&script_path, script).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+    }
+    script_path
+}
+
+fn wait_until_file_predates_next_invocation(path: &std::path::Path) {
+    let modified = fs::metadata(path)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    while SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        <= modified
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn write_sleeping_codex(
@@ -119,6 +175,7 @@ done
 if [ -z "$last_message" ]; then
   exit 41
 fi
+touch "{source_image}"
 printf '{{"image_path":"{source_image}","note":"fake codex generated image"}}' > "$last_message"
 "#,
         argv_log = argv_log.display(),
@@ -185,6 +242,7 @@ case "$call_count" in
     ;;
 esac
 
+touch "$image_path"
 printf '{{"image_path":"%s","note":"fake codex generated image"}}' "$image_path" > "$last_message"
 "#,
         counter_file = counter_file.display(),
@@ -252,6 +310,7 @@ if [ "$call_count" -gt 2 ]; then
   exit 43
 fi
 
+touch "{first_source_image}"
 printf '{{"image_path":"{first_source_image}","note":"fake codex generated image"}}' > "$last_message"
 "#,
         counter_file = counter_file.display(),
@@ -330,6 +389,75 @@ fn generate_codex_backend_copies_image_and_writes_manifest_json_output_mode() {
         assert!(
             !manifest_text.contains(forbidden),
             "manifest leaked {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn generate_rejects_untrusted_preexisting_image_path_without_leaking() {
+    let temp = TempDir::new().unwrap();
+    let stale_source_image = temp.path().join("stale-source.png");
+    fs::write(&stale_source_image, b"stale-image-bytes").unwrap();
+    wait_until_file_predates_next_invocation(&stale_source_image);
+
+    let fake_codex = write_untrusted_path_codex(&temp, &stale_source_image);
+    let out_dir = temp.path().join("images-untrusted");
+
+    let output = Command::cargo_bin("codex-image")
+        .unwrap()
+        .arg("generate")
+        .arg("red circle secret prompt")
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--output")
+        .arg("json")
+        .env("CODEX_IMAGE_CODEX_BIN", &fake_codex)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(6));
+    assert!(output.stdout.is_empty(), "failure stdout must stay empty");
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr.trim_end().lines().count(),
+        1,
+        "failure stderr should be one diagnostics envelope"
+    );
+    let envelope: Value = serde_json::from_str(stderr.trim_end()).unwrap();
+    assert_eq!(
+        envelope["error"]["code"],
+        "response_contract.image_generation"
+    );
+
+    assert!(
+        !out_dir.join("manifest.json").exists(),
+        "untrusted source failure must not produce manifest"
+    );
+    if out_dir.exists() {
+        let copied_images = fs::read_dir(&out_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("image-"))
+            .count();
+        assert_eq!(copied_images, 0, "failure must not copy image artifacts");
+        assert_eq!(
+            count_last_message_artifacts(&out_dir),
+            0,
+            "failure must clean hidden final-message artifacts"
+        );
+    }
+
+    let stale_path = stale_source_image.to_string_lossy().to_string();
+    for forbidden in [
+        stale_path.as_str(),
+        "red circle secret prompt",
+        "Bearer",
+        "stale source",
+    ] {
+        assert!(
+            !stderr.contains(forbidden),
+            "stderr leaked forbidden source-path failure data: {forbidden}"
         );
     }
 }
@@ -704,6 +832,83 @@ fn generate_batch_success_from_prompt_file_writes_item_outputs_and_root_json_con
         !argv_tokens.iter().any(|arg| *arg == "7"),
         "timeout value must not be forwarded to Codex subprocess"
     );
+}
+
+#[test]
+fn generate_batch_rejects_untrusted_preexisting_image_path_without_root_manifest() {
+    let temp = TempDir::new().unwrap();
+    let stale_source_image = temp.path().join("stale-batch-source.png");
+    fs::write(&stale_source_image, b"stale-batch-image-bytes").unwrap();
+    wait_until_file_predates_next_invocation(&stale_source_image);
+
+    let fake_codex = write_untrusted_path_codex(&temp, &stale_source_image);
+    let prompt_file = temp.path().join("prompts.txt");
+    fs::write(&prompt_file, "first prompt secret\nsecond prompt secret\n").unwrap();
+
+    let out_dir = temp.path().join("out-untrusted");
+    fs::create_dir_all(&out_dir).unwrap();
+    fs::write(out_dir.join("manifest.json"), "{\"stale\":true}").unwrap();
+
+    let output = Command::cargo_bin("codex-image")
+        .unwrap()
+        .arg("generate")
+        .arg("--prompt-file")
+        .arg(&prompt_file)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--output")
+        .arg("json")
+        .env("CODEX_IMAGE_CODEX_BIN", &fake_codex)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(6));
+    assert!(output.stdout.is_empty(), "failure stdout must stay empty");
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        stderr.trim_end().lines().count(),
+        1,
+        "failure stderr should be one diagnostics envelope"
+    );
+    let envelope: Value = serde_json::from_str(stderr.trim_end()).unwrap();
+    assert_eq!(
+        envelope["error"]["code"],
+        "response_contract.image_generation"
+    );
+
+    assert!(
+        !out_dir.join("manifest.json").exists(),
+        "stale root manifest must be removed and not rewritten"
+    );
+    assert!(
+        !out_dir.join("item-0001").join("manifest.json").exists(),
+        "failed first batch item must not write an item manifest"
+    );
+    assert!(
+        !out_dir.join("item-0001").join("image-0001.png").exists(),
+        "failed first batch item must not copy an image"
+    );
+    assert!(
+        !out_dir.join("item-0002").exists(),
+        "batch must stop after untrusted first item"
+    );
+
+    let stale_path = stale_source_image.to_string_lossy().to_string();
+    let prompt_file_path = prompt_file.to_string_lossy().to_string();
+    for forbidden in [
+        stale_path.as_str(),
+        prompt_file_path.as_str(),
+        "first prompt secret",
+        "second prompt secret",
+        "Bearer",
+        "stale source",
+    ] {
+        assert!(
+            !stderr.contains(forbidden),
+            "stderr leaked forbidden batch source-path failure data: {forbidden}"
+        );
+    }
 }
 
 #[test]

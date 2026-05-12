@@ -2,6 +2,7 @@ pub mod cli;
 pub mod codex;
 pub mod config;
 pub mod diagnostics;
+pub mod generation_diagnostics;
 pub mod output;
 pub mod skill_install_ux;
 pub mod skill_installer;
