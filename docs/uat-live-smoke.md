@@ -38,8 +38,8 @@ The script prints phase logs and fails fast on any contract break:
 1. Creates temporary install/output roots.
 2. Installs local binary with `cargo install --path . --root <temp> --force`.
 3. Runs:
-   - `generate "UAT smoke image from codex-image" --out <temp-out>`
-4. Parses stdout JSON and validates:
+   - `generate "UAT smoke image from codex-image" --out <temp-out> --output json`
+4. Parses stdout JSON (explicitly emitted by `--output json`) and validates:
    - `manifest_path` exists and matches `<temp-out>/manifest.json`
    - `manifest.json` is valid JSON
    - every declared image path exists
@@ -66,6 +66,6 @@ The script prints phase logs and fails fast on any contract break:
 
 1. Install local binary to a temp root.
 2. Ensure Codex itself works and is logged in.
-3. Run `generate ... --out <dir>` and inspect `manifest.json` plus image files.
+3. Run `generate ... --out <dir> --output json`, then inspect stdout JSON, `manifest.json`, and image files.
 
 Use normal redaction discipline: do not print tokens, raw auth files, bearer headers, raw upstream bodies, or raw base64 payloads.

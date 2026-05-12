@@ -50,7 +50,13 @@ HOME="$temp_home" "$binary" --help >/dev/null
 
 PHASE="generate-help"
 log_phase "executing codex-image generate --help"
-HOME="$temp_home" "$binary" generate --help | grep -q -- '--out'
+generate_help="$(HOME="$temp_home" "$binary" generate --help)"
+for marker in '--out' '--output' '--quiet' '--prompt-file' '--timeout' '--debug-diagnostics'; do
+  if ! grep -q -- "$marker" <<<"$generate_help"; then
+    echo "[verify-local-install] ERROR phase=$PHASE missing generate help marker: $marker" >&2
+    exit 1
+  fi
+done
 
 PHASE="removed-auth-commands"
 log_phase "confirming removed auth lifecycle commands are unavailable"
