@@ -161,12 +161,11 @@ impl SanitizedCommand {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct BatchDiagnosticsSummary {
-    pub prompt_count: usize,
-    pub attempted_count: usize,
-    pub succeeded_count: usize,
-    pub failed_count: usize,
+    pub planned_items: usize,
+    pub completed_items: usize,
+    pub failed_item_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

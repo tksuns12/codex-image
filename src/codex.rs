@@ -57,6 +57,13 @@ impl CodexDiagnosticsRecorder {
         }
     }
 
+    pub fn for_item(&self, item_index: usize) -> Self {
+        Self {
+            runs: Arc::clone(&self.runs),
+            item_index: Some(item_index),
+        }
+    }
+
     pub fn runs(&self) -> Vec<CodexRunDiagnostics> {
         self.runs
             .lock()

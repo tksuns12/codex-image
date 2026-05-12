@@ -11,9 +11,9 @@ use crate::codex::{
 };
 use crate::diagnostics::CliError;
 use crate::generation_diagnostics::{
-    write_generation_diagnostics, GenerationDiagnostics, GenerationDiagnosticsMetadata,
-    GenerationDiagnosticsMode, GenerationDiagnosticsResult, GenerationDiagnosticsStdoutMode,
-    PromptSourceKind,
+    write_generation_diagnostics, BatchDiagnosticsSummary, GenerationDiagnostics,
+    GenerationDiagnosticsMetadata, GenerationDiagnosticsMode, GenerationDiagnosticsResult,
+    GenerationDiagnosticsStdoutMode, PromptSourceKind,
 };
 use crate::output::{
     remove_batch_manifest_if_exists, write_batch_generation_manifest,
@@ -363,14 +363,33 @@ fn generate(
     let recorder = debug_diagnostics
         .as_ref()
         .map(|_| CodexDiagnosticsRecorder::new(None));
+    let mut batch_summary = if mode == GenerationDiagnosticsMode::Batch {
+        Some(BatchDiagnosticsSummary {
+            planned_items: 0,
+            completed_items: 0,
+            failed_item_index: None,
+        })
+    } else {
+        None
+    };
 
     let generation_result = match (prompt, prompt_file) {
         (Some(prompt), None) => {
             generate_single_prompt(&prompt, &out, timeout_duration, recorder.clone())
                 .map(GenerateSuccessOutput::Single)
         }
-        (None, Some(prompt_file)) => generate_prompt_batch(&prompt_file, &out, timeout_duration)
-            .map(GenerateSuccessOutput::Batch),
+        (None, Some(prompt_file)) => {
+            match generate_prompt_batch(&prompt_file, &out, timeout_duration, recorder.as_ref()) {
+                Ok((manifest, summary)) => {
+                    batch_summary = Some(summary);
+                    Ok(GenerateSuccessOutput::Batch(manifest))
+                }
+                Err(batch_failure) => {
+                    batch_summary = Some(batch_failure.summary);
+                    Err(batch_failure.error)
+                }
+            }
+        }
         _ => Err(CliError::Unknown),
     };
 
@@ -389,6 +408,7 @@ fn generate(
                     output,
                     timeout,
                     runs,
+                    batch_summary,
                     None,
                 );
                 write_generation_diagnostics(path, &diagnostics)?;
@@ -418,6 +438,7 @@ fn generate(
                     output,
                     timeout,
                     runs,
+                    batch_summary,
                     Some(&err),
                 );
                 let _ = write_generation_diagnostics(path, &diagnostics);
@@ -451,6 +472,7 @@ fn build_generation_diagnostics(
     output: OutputArgs,
     timeout_seconds: u64,
     runs: Vec<crate::generation_diagnostics::CodexRunDiagnostics>,
+    batch_summary: Option<BatchDiagnosticsSummary>,
     failure: Option<&CliError>,
 ) -> GenerationDiagnostics {
     let mut diagnostics =
@@ -462,6 +484,10 @@ fn build_generation_diagnostics(
             timeout_seconds,
         ))
         .with_runs(runs);
+
+    if let Some(batch_summary) = batch_summary {
+        diagnostics = diagnostics.with_batch_summary(batch_summary);
+    }
 
     if let Some(failure) = failure {
         diagnostics = diagnostics.with_failure(failure);
@@ -475,6 +501,12 @@ fn build_generation_diagnostics(
 enum GenerateSuccessOutput {
     Single(GenerationManifest),
     Batch(BatchGenerationManifest),
+}
+
+#[derive(Debug)]
+struct BatchGenerationFailure {
+    error: CliError,
+    summary: BatchDiagnosticsSummary,
 }
 
 fn generate_single_prompt(
@@ -499,19 +531,47 @@ fn generate_prompt_batch(
     prompt_file: &Path,
     out: &Path,
     timeout: std::time::Duration,
-) -> Result<BatchGenerationManifest, CliError> {
-    let prompts = read_prompt_file_prompts(prompt_file)?;
+    diagnostics: Option<&CodexDiagnosticsRecorder>,
+) -> Result<(BatchGenerationManifest, BatchDiagnosticsSummary), BatchGenerationFailure> {
+    let prompts = read_prompt_file_prompts(prompt_file).map_err(|error| BatchGenerationFailure {
+        error,
+        summary: BatchDiagnosticsSummary {
+            planned_items: 0,
+            completed_items: 0,
+            failed_item_index: None,
+        },
+    })?;
 
-    remove_batch_manifest_if_exists(out)?;
+    let mut summary = BatchDiagnosticsSummary {
+        planned_items: prompts.len(),
+        completed_items: 0,
+        failed_item_index: None,
+    };
+
+    remove_batch_manifest_if_exists(out).map_err(|error| BatchGenerationFailure { error, summary })?;
 
     let mut item_manifests = Vec::with_capacity(prompts.len());
     for (index, prompt) in prompts.iter().enumerate() {
-        let item_out_dir = out.join(format!("item-{item_index:04}", item_index = index + 1));
-        let item_manifest = generate_single_prompt(prompt, &item_out_dir, timeout, None)?;
-        item_manifests.push(item_manifest);
+        let item_index = index + 1;
+        let item_out_dir = out.join(format!("item-{item_index:04}"));
+        let item_diagnostics = diagnostics.map(|session| session.for_item(item_index));
+
+        match generate_single_prompt(prompt, &item_out_dir, timeout, item_diagnostics) {
+            Ok(item_manifest) => {
+                summary.completed_items += 1;
+                item_manifests.push(item_manifest);
+            }
+            Err(error) => {
+                summary.failed_item_index = Some(item_index);
+                return Err(BatchGenerationFailure { error, summary });
+            }
+        }
     }
 
-    write_batch_generation_manifest(prompt_file, GPT_IMAGE_MODEL, out, &item_manifests)
+    let manifest = write_batch_generation_manifest(prompt_file, GPT_IMAGE_MODEL, out, &item_manifests)
+        .map_err(|error| BatchGenerationFailure { error, summary })?;
+
+    Ok((manifest, summary))
 }
 
 fn read_prompt_file_prompts(prompt_file: &Path) -> Result<Vec<String>, CliError> {
