@@ -461,6 +461,36 @@ fn diagnostics_binary_update_errors_map_to_stable_codes_without_leaks() {
             "api.update_asset_download_failed",
         ),
         (
+            UpdateError::MissingChecksumAsset,
+            ExitCode::ResponseContract,
+            "response_contract.update_checksum_invalid",
+        ),
+        (
+            UpdateError::DuplicateChecksumAsset,
+            ExitCode::ResponseContract,
+            "response_contract.update_checksum_invalid",
+        ),
+        (
+            UpdateError::ChecksumMetadataInvalid,
+            ExitCode::ResponseContract,
+            "response_contract.update_checksum_invalid",
+        ),
+        (
+            UpdateError::ChecksumEntryMissing,
+            ExitCode::ResponseContract,
+            "response_contract.update_checksum_invalid",
+        ),
+        (
+            UpdateError::ChecksumEntryDuplicate,
+            ExitCode::ResponseContract,
+            "response_contract.update_checksum_invalid",
+        ),
+        (
+            UpdateError::ChecksumMismatch,
+            ExitCode::ResponseContract,
+            "response_contract.update_checksum_invalid",
+        ),
+        (
             UpdateError::ReleaseMetadataInvalid,
             ExitCode::ResponseContract,
             "response_contract.update_archive_invalid",

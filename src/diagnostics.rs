@@ -362,6 +362,18 @@ fn classify_binary_update_error(error: &UpdateError) -> ErrorClassification {
             hint: "Retry later or verify network access to GitHub release assets.",
             exit_code: ExitCode::Api,
         },
+        UpdateError::MissingChecksumAsset
+        | UpdateError::DuplicateChecksumAsset
+        | UpdateError::ChecksumMetadataInvalid
+        | UpdateError::ChecksumEntryMissing
+        | UpdateError::ChecksumEntryDuplicate
+        | UpdateError::ChecksumMismatch => ErrorClassification {
+            code: "response_contract.update_checksum_invalid",
+            message: "release checksum metadata did not match expected contract",
+            recoverable: false,
+            hint: "Retry with a different version; if it persists, report the release checksum issue.",
+            exit_code: ExitCode::ResponseContract,
+        },
         UpdateError::ReleaseMetadataInvalid
         | UpdateError::MissingReleaseAsset
         | UpdateError::DuplicateReleaseAsset
