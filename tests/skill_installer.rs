@@ -82,22 +82,42 @@ fn skill_installer_content_includes_prompting_checklist_concepts() {
 fn skill_installer_content_includes_expected_command_guidance() {
     let body = render_skill_body();
 
-    assert!(
-        body.contains("codex-image generate \"<prompt>\" --out <dir>"),
-        "skill body must describe the generate command: codex-image generate \"<prompt>\" --out <dir>"
-    );
-    assert!(
-        body.contains(
-            "codex-image skill install --tool <claude|claude-code|codex|pi|opencode> --scope <global|project> --yes"
-        ),
-        "skill body must describe the non-interactive install command"
-    );
-    assert!(
-        body.contains(
-            "codex-image skill update --tool <claude|claude-code|codex|pi|opencode> --scope <global|project> --yes"
-        ),
-        "skill body must describe the non-interactive update command"
-    );
+    for command in [
+        "codex-image generate \"<prompt>\" --out <dir> --output json",
+        "codex-image generate --prompt-file ./prompts.txt --out <dir> --output json --timeout 120",
+        "codex-image generate --prompt-file ./prompts.txt --out <dir> --output json --debug-diagnostics ./diagnostics.json",
+        "codex-image generate \"<prompt>\" --out <dir> --quiet",
+    ] {
+        assert!(
+            body.contains(command),
+            "skill body must retain automation command example: {command}"
+        );
+    }
+}
+
+#[test]
+fn skill_installer_content_includes_automation_contract_concepts() {
+    let body = render_skill_body().to_ascii_lowercase();
+
+    for phrase in [
+        "--output json",
+        "--quiet",
+        "--prompt-file",
+        "--timeout",
+        "--debug-diagnostics",
+        "item-0001",
+        "blank lines and lines beginning with `#` are skipped",
+        "root `manifest.json` is written only after every item succeeds",
+        "local codex subprocess timeout",
+        "diagnostics are sanitized/redacted",
+        "not a raw codex transcript",
+        "when `--quiet` is used, rely on generated files and exit status",
+    ] {
+        assert!(
+            body.contains(phrase),
+            "skill body must retain automation contract phrase: {phrase}"
+        );
+    }
 }
 
 #[test]
