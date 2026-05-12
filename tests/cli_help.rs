@@ -32,6 +32,22 @@ fn cli_help_generate_help_documents_required_out_prompt_and_timeout_contract() {
 }
 
 #[test]
+fn cli_help_generate_debug_diagnostics_flag_documents_sanitized_sidecar_file() {
+    let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
+    cmd.arg("generate").arg("--help");
+
+    cmd.assert()
+        .success()
+        .stdout(
+            predicate::str::contains("--debug-diagnostics <FILE>")
+                .or(predicate::str::contains("--debug-diagnostics <file>")),
+        )
+        .stdout(predicate::str::contains("sanitized"))
+        .stdout(predicate::str::contains("diagnostics"))
+        .stdout(predicate::str::contains("sidecar"));
+}
+
+#[test]
 fn cli_help_output_mode_generate_help_lists_output_and_quiet_flags() {
     let mut cmd = Command::cargo_bin("codex-image").expect("binary exists");
     cmd.arg("generate").arg("--help");

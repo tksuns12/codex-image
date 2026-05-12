@@ -11,7 +11,8 @@ use crate::codex::{
 use crate::diagnostics::CliError;
 use crate::output::{
     remove_batch_manifest_if_exists, write_batch_generation_manifest,
-    write_generation_output_from_files, BatchGenerationManifest, GenerationManifest,
+    write_generation_output_from_sources, BatchGenerationManifest, GeneratedImageSource,
+    GenerationManifest,
 };
 use crate::skill_install_ux::{
     expand_selected_targets, interactive_target_options, select_interactive_targets,
@@ -95,6 +96,9 @@ enum Commands {
             default_value_t = DEFAULT_CODEX_EXEC_TIMEOUT_SECS
         )]
         timeout: u64,
+        /// Write a sanitized debug diagnostics sidecar JSON file.
+        #[arg(long, value_name = "FILE")]
+        debug_diagnostics: Option<PathBuf>,
         #[command(flatten)]
         output: OutputArgs,
     },
@@ -313,8 +317,9 @@ fn dispatch(cli: Cli) -> Result<(), CliError> {
             prompt_file,
             out,
             timeout,
+            debug_diagnostics,
             output,
-        } => generate(prompt, prompt_file, out, timeout, output),
+        } => generate(prompt, prompt_file, out, timeout, debug_diagnostics, output),
         Commands::Update {
             yes,
             dry_run,
@@ -330,6 +335,7 @@ fn generate(
     prompt_file: Option<PathBuf>,
     out: PathBuf,
     timeout: u64,
+    _debug_diagnostics: Option<PathBuf>,
     output: OutputArgs,
 ) -> Result<(), CliError> {
     let timeout = std::time::Duration::from_secs(timeout);
@@ -374,8 +380,10 @@ fn generate_single_prompt(
 ) -> Result<GenerationManifest, CliError> {
     let generated =
         generate_image_with_codex_with_options(prompt, out, CodexGenerationOptions { timeout })?;
+    let source =
+        GeneratedImageSource::trusted_after(generated.source_path, generated.source_not_before);
 
-    write_generation_output_from_files(prompt, GPT_IMAGE_MODEL, out, &[generated.source_path])
+    write_generation_output_from_sources(prompt, GPT_IMAGE_MODEL, out, &[source])
 }
 
 fn generate_prompt_batch(

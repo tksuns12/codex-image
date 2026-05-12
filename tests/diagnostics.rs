@@ -1,6 +1,16 @@
+use std::fs;
+
 use codex_image::config::ConfigError;
 use codex_image::diagnostics::{CliError, ExitCode};
+use codex_image::generation_diagnostics::{
+    write_generation_diagnostics, BatchDiagnosticsSummary, CodexRunDiagnostics, CodexRunStatus,
+    FinalMessageDiagnostics, FinalMessageStatus, GenerationDiagnostics,
+    GenerationDiagnosticsMetadata, GenerationDiagnosticsMode, GenerationDiagnosticsResult,
+    GenerationDiagnosticsStdoutMode, PromptSourceKind, RedactedFailure,
+    GENERATION_DIAGNOSTICS_SCHEMA, GENERATION_DIAGNOSTICS_SCHEMA_VERSION,
+};
 use codex_image::updater::UpdateError;
+use tempfile::TempDir;
 
 fn parse_envelope(err: &CliError) -> serde_json::Value {
     serde_json::to_value(err.error_envelope()).expect("error envelope serializes")
@@ -42,6 +52,100 @@ fn assert_error_contract_shape(json: &serde_json::Value) {
         .get("hint")
         .and_then(serde_json::Value::as_str)
         .is_some());
+}
+
+fn sample_generation_diagnostics() -> GenerationDiagnostics {
+    let leaked_source = CliError::CodexImageGenerationFailed {
+        source_message: "Bearer sk-test b64_json /tmp/codex-image-secret /home/alice CODEX_IMAGE_CODEX_BIN raw final-message JSON image_path note".to_string(),
+    };
+
+    GenerationDiagnostics::new(GenerationDiagnosticsMetadata::for_invocation_at(
+        1_700_000_000,
+        GenerationDiagnosticsMode::Batch,
+        GenerationDiagnosticsResult::Failure,
+        PromptSourceKind::PromptFile,
+        GenerationDiagnosticsStdoutMode::Json,
+        300,
+    ))
+    .with_batch_summary(BatchDiagnosticsSummary {
+        prompt_count: 2,
+        attempted_count: 1,
+        succeeded_count: 0,
+        failed_count: 1,
+    })
+    .with_failure(&leaked_source)
+    .with_runs(vec![CodexRunDiagnostics {
+        index: 1,
+        status: CodexRunStatus::FinalMessageInvalid,
+        elapsed_millis: Some(42),
+        exit_code: Some(1),
+        final_message: FinalMessageDiagnostics {
+            status: FinalMessageStatus::InvalidJson,
+        },
+        failure: Some(RedactedFailure::from_cli_error(&leaked_source)),
+    }])
+}
+
+#[test]
+fn diagnostics_debug_diagnostics_schema_v1_serializes_only_sanitized_fields() {
+    let diagnostics = sample_generation_diagnostics();
+    let rendered = serde_json::to_string_pretty(&diagnostics).expect("diagnostics serialize");
+    let json: serde_json::Value = serde_json::from_str(&rendered).expect("diagnostics json");
+
+    assert_eq!(json["schema"], GENERATION_DIAGNOSTICS_SCHEMA);
+    assert_eq!(
+        json["schema_version"],
+        GENERATION_DIAGNOSTICS_SCHEMA_VERSION
+    );
+    assert_eq!(json["metadata"]["mode"], "batch");
+    assert_eq!(json["metadata"]["result"], "failure");
+    assert_eq!(json["metadata"]["prompt_source"], "prompt_file");
+    assert_eq!(json["metadata"]["stdout_mode"], "json");
+    assert_eq!(json["metadata"]["command"]["program"], "[codex-binary]");
+    assert_eq!(json["batch"]["prompt_count"], 2);
+    assert_eq!(json["failure"]["code"], "api.codex_image_generation_failed");
+    assert_eq!(json["runs"][0]["status"], "final_message_invalid");
+    assert_eq!(json["runs"][0]["final_message"]["status"], "invalid_json");
+    assert_eq!(json["redaction"]["prompt_text"], "omitted");
+
+    for forbidden in [
+        "Bearer",
+        "sk-test",
+        "b64_json",
+        "/tmp/codex-image-secret",
+        "/home/alice",
+        "CODEX_IMAGE_CODEX_BIN",
+        "raw final-message JSON",
+        "\"image_path\"",
+        "\"note\"",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "diagnostics leaked forbidden sentinel: {forbidden}\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn diagnostics_debug_diagnostics_writer_creates_parent_and_maps_failures_to_output_write() {
+    let temp = TempDir::new().expect("tempdir");
+    let diagnostics = sample_generation_diagnostics();
+    let diagnostics_path = temp.path().join("nested").join("diagnostics.json");
+
+    write_generation_diagnostics(&diagnostics_path, &diagnostics).expect("diagnostics write");
+
+    let rendered = fs::read_to_string(&diagnostics_path).expect("diagnostics file exists");
+    let json: serde_json::Value = serde_json::from_str(&rendered).expect("diagnostics json");
+    assert_eq!(json["schema_version"], 1);
+
+    let parent_file = temp.path().join("not-a-directory");
+    fs::write(&parent_file, "not a directory").expect("write parent sentinel");
+    let err = write_generation_diagnostics(&parent_file.join("diagnostics.json"), &diagnostics)
+        .expect_err("file parent should fail");
+    let envelope = parse_envelope(&err);
+
+    assert_eq!(err.exit_code(), ExitCode::Filesystem);
+    assert_eq!(envelope["error"]["code"], "filesystem.output_write_failed");
 }
 
 #[test]

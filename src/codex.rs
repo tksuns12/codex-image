@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
@@ -29,6 +29,7 @@ impl Default for CodexGenerationOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexImageGeneration {
     pub source_path: PathBuf,
+    pub source_not_before: SystemTime,
     pub note: Option<String>,
 }
 
@@ -61,6 +62,7 @@ pub fn generate_image_with_codex_with_options(
     let _ = fs::remove_file(&last_message_path);
 
     let codex_prompt = build_codex_prompt(prompt);
+    let source_not_before = current_filesystem_timestamp_floor();
     let mut child = Command::new(&codex_bin)
         .arg("exec")
         .arg("--skip-git-repo-check")
@@ -111,8 +113,16 @@ pub fn generate_image_with_codex_with_options(
 
     Ok(CodexImageGeneration {
         source_path,
+        source_not_before,
         note: parsed.note,
     })
+}
+
+fn current_filesystem_timestamp_floor() -> SystemTime {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    UNIX_EPOCH + Duration::from_secs(since_epoch.as_secs())
 }
 
 fn build_codex_prompt(prompt: &str) -> String {
