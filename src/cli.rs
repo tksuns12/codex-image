@@ -441,7 +441,7 @@ fn generate(
                     batch_summary,
                     Some(&err),
                 );
-                let _ = write_generation_diagnostics(path, &diagnostics);
+                write_generation_diagnostics(path, &diagnostics)?;
             }
             Err(err)
         }

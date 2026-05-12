@@ -91,7 +91,7 @@ done
 if [ -z "$last_message" ]; then
   exit 41
 fi
-printf 'not-json Bearer sk-malformed-final-message b64_json {broken' > "$last_message"
+printf '} Bearer sk-malformed-final-message b64_json {broken' > "$last_message"
 "#;
     fs::write(&script_path, script).unwrap();
     #[cfg(unix)]
@@ -588,6 +588,129 @@ fn generate_debug_diagnostics_single_success_write_failure_maps_to_filesystem_wi
         "diagnostics write failure must not leak the requested diagnostics path"
     );
     assert!(!stderr.contains("red circle secret prompt"));
+}
+
+#[test]
+fn generate_debug_diagnostics_single_failure_diag_write_failure_fails_closed_without_leaks() {
+    let temp = TempDir::new().unwrap();
+    let failing_codex = write_failing_codex(&temp);
+    let out_dir = temp
+        .path()
+        .join("images-generation-failure-diagnostics-write-failure");
+    let parent_file = temp.path().join("not-a-directory-generation-failure");
+    fs::write(&parent_file, "not a directory").unwrap();
+    let diagnostics_path = parent_file.join("diagnostics.json");
+    let prompt = "red circle Bearer sk-single-write-failure b64_json";
+
+    let output = Command::cargo_bin("codex-image")
+        .unwrap()
+        .arg("generate")
+        .arg(prompt)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--output")
+        .arg("json")
+        .arg("--debug-diagnostics")
+        .arg(&diagnostics_path)
+        .env("CODEX_IMAGE_CODEX_BIN", &failing_codex)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    assert!(
+        !out_dir.join("manifest.json").exists(),
+        "failed generation must not write a success manifest"
+    );
+    assert!(
+        !diagnostics_path.exists(),
+        "failed diagnostics write must not leave a partial diagnostics file"
+    );
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let envelope: Value = serde_json::from_str(stderr.trim_end()).unwrap();
+    assert_eq!(envelope["error"]["code"], "filesystem.output_write_failed");
+
+    let parent_file_path = parent_file.to_string_lossy().to_string();
+    let diagnostics_file_path = diagnostics_path.to_string_lossy().to_string();
+    let out_path = out_dir.to_string_lossy().to_string();
+    let fake_codex_path = failing_codex.to_string_lossy().to_string();
+    for forbidden in [
+        prompt,
+        "Bearer secret should not leak",
+        "sk-single-write-failure",
+        "b64_json",
+        "CODEX_IMAGE_CODEX_BIN",
+        parent_file_path.as_str(),
+        diagnostics_file_path.as_str(),
+        out_path.as_str(),
+        fake_codex_path.as_str(),
+    ] {
+        assert!(
+            !stderr.contains(forbidden),
+            "stderr leaked forbidden diagnostics-write failure data: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn generate_debug_diagnostics_missing_codex_writes_redacted_sidecar_without_env_key() {
+    let temp = TempDir::new().unwrap();
+    let out_dir = temp.path().join("images-missing-codex-diagnostics");
+    let diagnostics_path = temp.path().join("missing-codex-diagnostics.json");
+    let missing_codex = temp.path().join("missing-codex-CODEX_IMAGE_CODEX_BIN");
+    let prompt = "red circle Bearer sk-missing-codex b64_json";
+
+    let output = Command::cargo_bin("codex-image")
+        .unwrap()
+        .arg("generate")
+        .arg(prompt)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--output")
+        .arg("json")
+        .arg("--debug-diagnostics")
+        .arg(&diagnostics_path)
+        .env("CODEX_IMAGE_CODEX_BIN", &missing_codex)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let envelope: Value = serde_json::from_str(stderr.trim_end()).unwrap();
+    assert_eq!(envelope["error"]["code"], "config.codex_cli_unavailable");
+
+    let rendered = fs::read_to_string(&diagnostics_path).unwrap();
+    let diagnostics: Value = serde_json::from_str(&rendered).unwrap();
+    assert_eq!(diagnostics["metadata"]["mode"], "single");
+    assert_eq!(diagnostics["metadata"]["result"], "failure");
+    assert_eq!(
+        diagnostics["failure"]["code"],
+        "config.codex_cli_unavailable"
+    );
+    assert!(diagnostics["runs"].as_array().unwrap().is_empty());
+
+    let rendered_and_stderr = format!("{rendered}\n{stderr}");
+    let out_path = out_dir.to_string_lossy().to_string();
+    let diagnostics_file_path = diagnostics_path.to_string_lossy().to_string();
+    let missing_codex_path = missing_codex.to_string_lossy().to_string();
+    for forbidden in [
+        prompt,
+        "Bearer",
+        "sk-missing-codex",
+        "b64_json",
+        "CODEX_IMAGE_CODEX_BIN",
+        out_path.as_str(),
+        diagnostics_file_path.as_str(),
+        missing_codex_path.as_str(),
+    ] {
+        assert!(
+            !rendered_and_stderr.contains(forbidden),
+            "diagnostics or stderr leaked forbidden missing-Codex data: {forbidden}"
+        );
+    }
 }
 
 #[test]
@@ -1392,6 +1515,101 @@ fn generate_debug_diagnostics_batch_failure_reports_partial_progress_and_redacts
         assert!(
             !stderr.contains(forbidden),
             "stderr leaked forbidden batch failure data: {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn generate_debug_diagnostics_batch_failure_diag_write_failure_fails_closed_without_leaks() {
+    let temp = TempDir::new().unwrap();
+    let first_source_image = temp.path().join("codex-source-one.png");
+    fs::write(&first_source_image, b"first-image-bytes").unwrap();
+
+    let argv_log = temp.path().join("batch-diagnostics-write-failure-argv.log");
+    let token_sentinel = "sk-batch-diagnostics-write-failure-fixture-12345";
+    let (fake_codex, counter_file) =
+        write_batch_second_fail_codex(&temp, &first_source_image, &argv_log, token_sentinel);
+
+    let prompt_file = temp.path().join("prompts.txt");
+    fs::write(
+        &prompt_file,
+        "first prompt\nsecond prompt Bearer secret\nthird prompt\n",
+    )
+    .unwrap();
+
+    let out_dir = temp.path().join("out-batch-diagnostics-write-failure");
+    fs::create_dir_all(&out_dir).unwrap();
+    fs::write(out_dir.join("manifest.json"), "{\"stale\":true}").unwrap();
+    let parent_file = temp.path().join("not-a-directory-batch-diagnostics");
+    fs::write(&parent_file, "not a directory").unwrap();
+    let diagnostics_path = parent_file.join("diagnostics.json");
+
+    let output = Command::cargo_bin("codex-image")
+        .unwrap()
+        .arg("generate")
+        .arg("--prompt-file")
+        .arg(&prompt_file)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--output")
+        .arg("json")
+        .arg("--debug-diagnostics")
+        .arg(&diagnostics_path)
+        .env("CODEX_IMAGE_CODEX_BIN", &fake_codex)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty(), "failure stdout must stay empty");
+    assert!(
+        !out_dir.join("manifest.json").exists(),
+        "stale root manifest must be removed and not rewritten on partial failure"
+    );
+    assert!(out_dir.join("item-0001").join("manifest.json").is_file());
+    assert!(
+        !out_dir.join("item-0003").exists(),
+        "batch must stop before the third item"
+    );
+    assert!(
+        !diagnostics_path.exists(),
+        "failed diagnostics write must not leave a partial diagnostics file"
+    );
+
+    let call_count: usize = fs::read_to_string(&counter_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(call_count, 2, "Codex should run exactly twice");
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let envelope: Value = serde_json::from_str(stderr.trim_end()).unwrap();
+    assert_eq!(envelope["error"]["code"], "filesystem.output_write_failed");
+
+    let prompt_file_path = prompt_file.to_string_lossy().to_string();
+    let out_dir_path = out_dir.to_string_lossy().to_string();
+    let diagnostics_file_path = diagnostics_path.to_string_lossy().to_string();
+    let parent_file_path = parent_file.to_string_lossy().to_string();
+    let fake_codex_path = fake_codex.to_string_lossy().to_string();
+    let first_source_path = first_source_image.to_string_lossy().to_string();
+    for forbidden in [
+        "first prompt",
+        "second prompt Bearer secret",
+        "third prompt",
+        token_sentinel,
+        "/tmp/sensitive/path.txt",
+        "Bearer",
+        "CODEX_IMAGE_CODEX_BIN",
+        prompt_file_path.as_str(),
+        out_dir_path.as_str(),
+        diagnostics_file_path.as_str(),
+        parent_file_path.as_str(),
+        fake_codex_path.as_str(),
+        first_source_path.as_str(),
+    ] {
+        assert!(
+            !stderr.contains(forbidden),
+            "stderr leaked forbidden batch diagnostics-write failure data: {forbidden}"
         );
     }
 }

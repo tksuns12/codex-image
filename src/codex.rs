@@ -379,6 +379,9 @@ fn parse_final_message_value(message: &str) -> Result<serde_json::Value, FinalMe
 
     let start = message.find('{').ok_or_else(invalid_final_message_json)?;
     let end = message.rfind('}').ok_or_else(invalid_final_message_json)?;
+    if start > end {
+        return Err(invalid_final_message_json());
+    }
 
     serde_json::from_str::<serde_json::Value>(&message[start..=end])
         .map_err(|_| invalid_final_message_json())
