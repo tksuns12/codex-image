@@ -68,10 +68,9 @@ fn sample_generation_diagnostics() -> GenerationDiagnostics {
         300,
     ))
     .with_batch_summary(BatchDiagnosticsSummary {
-        prompt_count: 2,
-        attempted_count: 1,
-        succeeded_count: 0,
-        failed_count: 1,
+        planned_items: 2,
+        completed_items: 1,
+        failed_item_index: Some(2),
     })
     .with_failure(&leaked_source)
     .with_runs(vec![CodexRunDiagnostics::failure(
@@ -109,7 +108,9 @@ fn diagnostics_debug_diagnostics_schema_v1_serializes_only_sanitized_fields() {
         json["metadata"]["command"],
         serde_json::to_value(SanitizedCommand::codex_subprocess()).unwrap()
     );
-    assert_eq!(json["batch"]["prompt_count"], 2);
+    assert_eq!(json["batch"]["planned_items"], 2);
+    assert_eq!(json["batch"]["completed_items"], 1);
+    assert_eq!(json["batch"]["failed_item_index"], 2);
     assert_eq!(json["failure"]["code"], "api.codex_image_generation_failed");
     assert_eq!(json["runs"][0]["phase"], "generate_image");
     assert_eq!(json["runs"][0]["outcome"], "failed");
