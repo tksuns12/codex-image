@@ -240,7 +240,7 @@ fn diagnostics_codex_backend_errors_are_redacted_and_actionable() {
     );
     assert_eq!(
         unavailable_json["error"]["hint"],
-        "Install Codex or set CODEX_IMAGE_CODEX_BIN to the Codex executable."
+        "Install Codex or configure the Codex executable."
     );
 
     let failed = CliError::CodexImageGenerationFailed {

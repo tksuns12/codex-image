@@ -163,7 +163,7 @@ impl CliError {
                 code: "config.codex_cli_unavailable",
                 message: "Codex CLI executable was not found",
                 recoverable: true,
-                hint: "Install Codex or set CODEX_IMAGE_CODEX_BIN to the Codex executable.",
+                hint: "Install Codex or configure the Codex executable.",
                 exit_code: ExitCode::UsageOrConfig,
             },
             Self::CodexImageGenerationFailed { .. } => ErrorClassification {
