@@ -96,7 +96,7 @@ impl GenerationDiagnosticsMetadata {
             prompt_source,
             stdout_mode,
             timeout_seconds,
-            command: SanitizedCommand::codex_image_generation(),
+            command: SanitizedCommand::codex_subprocess(),
         }
     }
 }
@@ -137,9 +137,9 @@ pub struct SanitizedCommand {
 }
 
 impl SanitizedCommand {
-    pub fn codex_image_generation() -> Self {
+    pub fn codex_subprocess() -> Self {
         Self {
-            program: "[codex-binary]",
+            program: "codex",
             args: vec![
                 "exec",
                 "--skip-git-repo-check",
@@ -155,6 +155,10 @@ impl SanitizedCommand {
             ],
         }
     }
+
+    pub fn codex_image_generation() -> Self {
+        Self::codex_subprocess()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -168,14 +172,90 @@ pub struct BatchDiagnosticsSummary {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CodexRunDiagnostics {
     pub index: usize,
+    pub item_index: Option<usize>,
+    pub phase: CodexRunPhase,
+    pub outcome: CodexRunOutcome,
     pub status: CodexRunStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub elapsed_millis: Option<u64>,
+    pub timeout_seconds: u64,
+    pub timed_out: bool,
+    pub elapsed_millis: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    pub command: SanitizedCommand,
     pub final_message: FinalMessageDiagnostics,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<RedactedFailure>,
+}
+
+impl CodexRunDiagnostics {
+    pub fn success(
+        index: usize,
+        item_index: Option<usize>,
+        timeout_seconds: u64,
+        elapsed_millis: u64,
+        exit_code: i32,
+        final_message: FinalMessageDiagnostics,
+    ) -> Self {
+        Self {
+            index,
+            item_index,
+            phase: CodexRunPhase::GenerateImage,
+            outcome: CodexRunOutcome::Succeeded,
+            status: CodexRunStatus::Succeeded,
+            timeout_seconds,
+            timed_out: false,
+            elapsed_millis,
+            exit_code: Some(exit_code),
+            command: SanitizedCommand::codex_subprocess(),
+            final_message,
+            failure: None,
+        }
+    }
+
+    pub fn failure(
+        index: usize,
+        item_index: Option<usize>,
+        timeout_seconds: u64,
+        elapsed_millis: u64,
+        exit_code: Option<i32>,
+        status: CodexRunStatus,
+        final_message: FinalMessageDiagnostics,
+        failure: &CliError,
+    ) -> Self {
+        let timed_out = status == CodexRunStatus::TimedOut;
+        Self {
+            index,
+            item_index,
+            phase: CodexRunPhase::GenerateImage,
+            outcome: if timed_out {
+                CodexRunOutcome::TimedOut
+            } else {
+                CodexRunOutcome::Failed
+            },
+            status,
+            timeout_seconds,
+            timed_out,
+            elapsed_millis,
+            exit_code,
+            command: SanitizedCommand::codex_subprocess(),
+            final_message,
+            failure: Some(RedactedFailure::from_cli_error(failure)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexRunPhase {
+    GenerateImage,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexRunOutcome {
+    Succeeded,
+    Failed,
+    TimedOut,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -191,6 +271,67 @@ pub enum CodexRunStatus {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct FinalMessageDiagnostics {
     pub status: FinalMessageStatus,
+    pub presence: FinalMessagePresence,
+    pub parse: FinalMessageParseStatus,
+    #[serde(rename = "image_path_status")]
+    pub image_path: FinalMessageFieldStatus,
+    #[serde(rename = "note_status")]
+    pub note: FinalMessageFieldStatus,
+}
+
+impl FinalMessageDiagnostics {
+    pub fn not_observed() -> Self {
+        Self {
+            status: FinalMessageStatus::NotObserved,
+            presence: FinalMessagePresence::NotObserved,
+            parse: FinalMessageParseStatus::NotAttempted,
+            image_path: FinalMessageFieldStatus::NotObserved,
+            note: FinalMessageFieldStatus::NotObserved,
+        }
+    }
+
+    pub fn missing() -> Self {
+        Self {
+            status: FinalMessageStatus::Missing,
+            presence: FinalMessagePresence::Missing,
+            parse: FinalMessageParseStatus::NotAttempted,
+            image_path: FinalMessageFieldStatus::NotObserved,
+            note: FinalMessageFieldStatus::NotObserved,
+        }
+    }
+
+    pub fn invalid_json() -> Self {
+        Self {
+            status: FinalMessageStatus::InvalidJson,
+            presence: FinalMessagePresence::Present,
+            parse: FinalMessageParseStatus::InvalidJson,
+            image_path: FinalMessageFieldStatus::NotObserved,
+            note: FinalMessageFieldStatus::NotObserved,
+        }
+    }
+
+    pub fn contract_invalid(
+        image_path: FinalMessageFieldStatus,
+        note: FinalMessageFieldStatus,
+    ) -> Self {
+        Self {
+            status: FinalMessageStatus::ContractInvalid,
+            presence: FinalMessagePresence::Present,
+            parse: FinalMessageParseStatus::ContractInvalid,
+            image_path,
+            note,
+        }
+    }
+
+    pub fn parsed(note: FinalMessageFieldStatus) -> Self {
+        Self {
+            status: FinalMessageStatus::Parsed,
+            presence: FinalMessagePresence::Present,
+            parse: FinalMessageParseStatus::Parsed,
+            image_path: FinalMessageFieldStatus::Present,
+            note,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -201,6 +342,31 @@ pub enum FinalMessageStatus {
     InvalidJson,
     ContractInvalid,
     Parsed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalMessagePresence {
+    NotObserved,
+    Missing,
+    Present,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalMessageParseStatus {
+    NotAttempted,
+    InvalidJson,
+    ContractInvalid,
+    Parsed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalMessageFieldStatus {
+    NotObserved,
+    Missing,
+    Present,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
