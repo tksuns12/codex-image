@@ -13,6 +13,7 @@ use codex_image::updater::{
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use predicates::prelude::*;
+use sha2::{Digest, Sha256};
 use tar::Builder;
 use tempfile::tempdir;
 use zip::write::FileOptions;
@@ -23,7 +24,7 @@ fn update_cli_helper_no_flags_updates_latest_release_by_default() {
         .with_release_result(Ok(
             parse_release_metadata(release_fixture()).expect("release fixture")
         ))
-        .with_download_result(Ok(download_archive_fixture()));
+        .with_valid_archive_downloads();
     let installer = RecordingInstaller::default();
 
     let temp = tempdir().expect("tempdir");
@@ -44,7 +45,7 @@ fn update_cli_helper_no_flags_updates_latest_release_by_default() {
     assert_eq!(result.status, "updated");
     assert_eq!(result.target_version, "v1.2.3");
     assert_eq!(source.last_requested_version(), None);
-    assert_eq!(source.download_calls(), 1);
+    assert_eq!(source.download_calls(), 2);
     assert_eq!(installer.calls(), 1, "no-flag update must replace binary");
     assert_eq!(
         installer
@@ -76,7 +77,7 @@ fn update_cli_helper_dry_run_validates_without_replacement() {
         .with_release_result(Ok(
             parse_release_metadata(release_fixture()).expect("release fixture")
         ))
-        .with_download_result(Ok(download_archive_fixture()));
+        .with_valid_archive_downloads();
     let installer = RecordingInstaller::default();
 
     let temp = tempdir().expect("tempdir");
@@ -98,7 +99,7 @@ fn update_cli_helper_dry_run_validates_without_replacement() {
     assert_eq!(result.target_version, "v1.2.3");
     assert_eq!(result.binary_path, binary_path.display().to_string());
     assert_eq!(source.last_requested_version(), Some("v1.2.3".to_string()));
-    assert_eq!(source.download_calls(), 1);
+    assert_eq!(source.download_calls(), 2);
     assert_eq!(installer.calls(), 0, "dry-run must not replace binary");
     assert_eq!(
         std::fs::read(&binary_path).expect("read binary"),
@@ -112,7 +113,7 @@ fn update_cli_helper_confirmed_update_calls_replacement() {
         .with_release_result(Ok(
             parse_release_metadata(release_fixture()).expect("release fixture")
         ))
-        .with_download_result(Ok(download_archive_fixture()));
+        .with_valid_archive_downloads();
     let installer = RecordingInstaller::default();
 
     let temp = tempdir().expect("tempdir");
@@ -131,7 +132,7 @@ fn update_cli_helper_confirmed_update_calls_replacement() {
     .expect("confirmed update should succeed");
 
     assert_eq!(result.status, "updated");
-    assert_eq!(source.download_calls(), 1);
+    assert_eq!(source.download_calls(), 2);
     assert_eq!(installer.calls(), 1, "confirmed update must replace binary");
     assert_eq!(
         installer
@@ -147,7 +148,7 @@ fn update_cli_helper_invalid_archive_maps_to_response_contract_cli_error() {
         .with_release_result(Ok(
             parse_release_metadata(release_fixture()).expect("release fixture")
         ))
-        .with_download_result(Ok(vec![1, 2, 3, 4]));
+        .with_archive_and_valid_checksum(vec![1, 2, 3, 4]);
     let installer = RecordingInstaller::default();
 
     let temp = tempdir().expect("tempdir");
@@ -183,7 +184,52 @@ fn update_cli_helper_invalid_archive_maps_to_response_contract_cli_error() {
         envelope.error.code,
         "response_contract.update_archive_invalid"
     );
+    assert_eq!(source.download_calls(), 2);
     assert_eq!(installer.calls(), 0, "failed validation must not replace");
+}
+
+#[test]
+fn update_cli_helper_checksum_failure_maps_to_response_contract_cli_error() {
+    let platform = current_platform().expect("supported platform for test host");
+    let asset = release_asset_name_for_tag("v1.2.3", &platform);
+    let source = FakeSource::new()
+        .with_release_result(Ok(
+            parse_release_metadata(release_fixture()).expect("release fixture")
+        ))
+        .with_download_result(Ok(download_archive_fixture()))
+        .with_download_result(Ok(format!(
+            "{}  {asset}\n",
+            sha256_hex(b"tampered archive")
+        )
+        .into_bytes()));
+    let installer = RecordingInstaller::default();
+
+    let temp = tempdir().expect("tempdir");
+    let binary_path = temp.path().join(current_binary_name());
+
+    let err = execute_update_command(
+        &source,
+        &installer,
+        binary_path,
+        env!("CARGO_PKG_VERSION").to_string(),
+        false,
+        true,
+        None,
+    )
+    .expect_err("checksum mismatch must fail");
+
+    assert!(
+        matches!(err, CliError::BinaryUpdate(UpdateError::ChecksumMismatch)),
+        "unexpected error: {err:?}"
+    );
+
+    let envelope = err.error_envelope();
+    assert_eq!(
+        envelope.error.code,
+        "response_contract.update_checksum_invalid"
+    );
+    assert_eq!(source.download_calls(), 2);
+    assert_eq!(installer.calls(), 0, "checksum failure must not replace");
 }
 
 #[test]
@@ -293,6 +339,19 @@ impl FakeSource {
         self
     }
 
+    fn with_valid_archive_downloads(self) -> Self {
+        let archive = download_archive_fixture();
+        let checksums = checksums_fixture_for_archive(&archive);
+        self.with_download_result(Ok(archive))
+            .with_download_result(Ok(checksums))
+    }
+
+    fn with_archive_and_valid_checksum(self, archive: Vec<u8>) -> Self {
+        let checksums = checksums_fixture_for_archive(&archive);
+        self.with_download_result(Ok(archive))
+            .with_download_result(Ok(checksums))
+    }
+
     fn download_calls(&self) -> usize {
         *self.download_calls.lock().expect("lock")
     }
@@ -393,6 +452,10 @@ fn release_fixture() -> &'static str {
             {
                 "name": "codex-image-v1.2.3-x86_64-pc-windows-msvc.zip",
                 "browser_download_url": "https://example.invalid/windows"
+            },
+            {
+                "name": "SHA256SUMS",
+                "browser_download_url": "https://example.invalid/SHA256SUMS"
             }
         ]
     }"#
@@ -427,6 +490,16 @@ fn download_archive_fixture() -> Vec<u8> {
         ArchiveKind::TarGz => tar_gz_fixture(&root, platform.binary_name()),
         ArchiveKind::Zip => zip_fixture(&root, platform.binary_name()),
     }
+}
+
+fn checksums_fixture_for_archive(archive: &[u8]) -> Vec<u8> {
+    let platform = current_platform().expect("supported platform for test host");
+    let asset = release_asset_name_for_tag("v1.2.3", &platform);
+    format!("{}  {asset}\n", sha256_hex(archive)).into_bytes()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn tar_gz_fixture(top_level_dir: &str, binary_name: &str) -> Vec<u8> {

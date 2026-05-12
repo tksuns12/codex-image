@@ -9,11 +9,13 @@ use std::time::Duration;
 use codex_image::updater::{
     current_platform, parse_release_metadata, release_asset_name_for_tag,
     replacement_supported_for_os, resolve_artifact, run_update, run_update_with_installer,
-    validate_archive_bytes, ArchiveKind, BinaryInstaller, GitHubClientTimeouts,
-    GitHubReleaseClient, Platform, UpdateError, UpdateOptions, UpdateResult, UpdateSource,
+    selected_archive_checksum, validate_archive_bytes, verify_archive_checksum, ArchiveKind,
+    BinaryInstaller, GitHubClientTimeouts, GitHubReleaseClient, Platform, UpdateError,
+    UpdateOptions, UpdateResult, UpdateSource, CHECKSUMS_ASSET_NAME,
 };
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use sha2::{Digest, Sha256};
 use tar::Builder;
 use tempfile::tempdir;
 use zip::write::FileOptions;
@@ -64,6 +66,59 @@ fn resolves_exactly_one_asset_for_platform() {
         "codex-image-v1.2.3-x86_64-unknown-linux-gnu.tar.gz"
     );
     assert_eq!(resolved.archive_kind, ArchiveKind::TarGz);
+    assert_eq!(resolved.checksum_asset_name, CHECKSUMS_ASSET_NAME);
+    assert_eq!(
+        resolved.checksum_download_url,
+        "https://example.invalid/SHA256SUMS"
+    );
+}
+
+#[test]
+fn missing_checksum_asset_returns_typed_error() {
+    let platform = Platform::new("linux", "x86_64").expect("linux platform");
+    let metadata = parse_release_metadata(
+        r#"{
+            "tag_name": "v1.2.3",
+            "assets": [
+                {
+                    "name": "codex-image-v1.2.3-x86_64-unknown-linux-gnu.tar.gz",
+                    "browser_download_url": "https://example.invalid/linux"
+                }
+            ]
+        }"#,
+    )
+    .expect("fixture parses");
+
+    let err = resolve_artifact(&metadata, &platform).expect_err("missing checksum must fail");
+    assert!(matches!(err, UpdateError::MissingChecksumAsset));
+}
+
+#[test]
+fn duplicate_checksum_asset_returns_typed_error() {
+    let platform = Platform::new("linux", "x86_64").expect("linux platform");
+    let metadata = parse_release_metadata(
+        r#"{
+            "tag_name": "v1.2.3",
+            "assets": [
+                {
+                    "name": "codex-image-v1.2.3-x86_64-unknown-linux-gnu.tar.gz",
+                    "browser_download_url": "https://example.invalid/linux"
+                },
+                {
+                    "name": "SHA256SUMS",
+                    "browser_download_url": "https://example.invalid/checksums-a"
+                },
+                {
+                    "name": "SHA256SUMS",
+                    "browser_download_url": "https://example.invalid/checksums-b"
+                }
+            ]
+        }"#,
+    )
+    .expect("fixture parses");
+
+    let err = resolve_artifact(&metadata, &platform).expect_err("duplicate checksum must fail");
+    assert!(matches!(err, UpdateError::DuplicateChecksumAsset));
 }
 
 #[test]
@@ -108,6 +163,66 @@ fn duplicate_target_asset_returns_typed_error() {
 
     let err = resolve_artifact(&metadata, &platform).expect_err("duplicate target must fail");
     assert!(matches!(err, UpdateError::DuplicateReleaseAsset));
+}
+
+#[test]
+fn parses_sha256sum_text_for_selected_archive() {
+    let archive = b"archive bytes";
+    let asset_name = "codex-image-v1.2.3-x86_64-unknown-linux-gnu.tar.gz";
+    let checksums = format!(
+        "{}  other-asset.tar.gz\n{} *{asset_name}\n",
+        sha256_hex(b"other bytes"),
+        sha256_hex(archive)
+    );
+
+    let selected = selected_archive_checksum(&checksums, asset_name).expect("entry resolves");
+    assert_eq!(selected, sha256_hex(archive));
+    verify_archive_checksum(&checksums, asset_name, archive).expect("checksum matches");
+}
+
+#[test]
+fn rejects_malformed_sha256sum_text() {
+    let cases = [
+        "",
+        "not-a-digest  archive.tar.gz\n",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  archive.tar.gz\n",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  archive with spaces.tar.gz\n",
+        "\n",
+    ];
+
+    for checksums in cases {
+        let err = selected_archive_checksum(checksums, "archive.tar.gz")
+            .expect_err("malformed checksum text must fail");
+        assert!(matches!(err, UpdateError::ChecksumMetadataInvalid));
+    }
+}
+
+#[test]
+fn rejects_missing_duplicate_and_mismatched_selected_checksum_entries() {
+    let asset_name = "codex-image-v1.2.3-x86_64-unknown-linux-gnu.tar.gz";
+    let archive = b"archive bytes";
+    let digest = sha256_hex(archive);
+
+    let missing =
+        selected_archive_checksum(&format!("{}  other-asset.tar.gz\n", digest), asset_name)
+            .expect_err("missing selected entry must fail");
+    assert!(matches!(missing, UpdateError::ChecksumEntryMissing));
+
+    let duplicate = selected_archive_checksum(
+        &format!("{digest}  {asset_name}\n{digest} *{asset_name}\n"),
+        asset_name,
+    )
+    .expect_err("duplicate selected entry must fail");
+    assert!(matches!(duplicate, UpdateError::ChecksumEntryDuplicate));
+
+    let mismatch = verify_archive_checksum(
+        &format!("{}  {asset_name}\n", sha256_hex(b"tampered")),
+        asset_name,
+        archive,
+    )
+    .expect_err("mismatched selected entry must fail");
+    assert!(matches!(mismatch, UpdateError::ChecksumMismatch));
 }
 
 #[test]
@@ -426,12 +541,117 @@ fn update_stops_on_download_error() {
 }
 
 #[test]
+fn update_stops_on_checksum_download_error() {
+    let source = FakeSource::new()
+        .with_release_result(Ok(
+            parse_release_metadata(release_fixture()).expect("release fixture")
+        ))
+        .with_download_result(Ok(download_archive_fixture()))
+        .with_download_result(Err(UpdateError::AssetDownloadFailed));
+    let installer = RecordingInstaller::default();
+    let temp = tempdir().expect("tempdir");
+    let binary_path = temp.path().join(current_binary_name());
+    std::fs::write(&binary_path, b"old").expect("seed binary");
+
+    let err = run_update_with_installer(&source, &options(&binary_path, false), &installer)
+        .expect_err("must fail");
+
+    assert!(matches!(err, UpdateError::AssetDownloadFailed));
+    assert_eq!(source.download_calls(), 2);
+    assert_eq!(installer.calls(), 0);
+    assert_eq!(std::fs::read(&binary_path).expect("read binary"), b"old");
+}
+
+#[test]
+fn update_stops_on_checksum_contract_errors_before_replacement() {
+    let archive = download_archive_fixture();
+    let asset_name = current_asset_name();
+    let digest = sha256_hex(&archive);
+    let cases = vec![
+        ("empty", Vec::new(), UpdateError::ChecksumMetadataInvalid),
+        (
+            "malformed",
+            b"not-a-checksum  archive.tar.gz\n".to_vec(),
+            UpdateError::ChecksumMetadataInvalid,
+        ),
+        (
+            "missing-selected-entry",
+            format!("{digest}  other-asset.tar.gz\n").into_bytes(),
+            UpdateError::ChecksumEntryMissing,
+        ),
+        (
+            "duplicate-selected-entry",
+            format!("{digest}  {asset_name}\n{digest} *{asset_name}\n").into_bytes(),
+            UpdateError::ChecksumEntryDuplicate,
+        ),
+        (
+            "mismatch",
+            format!("{}  {asset_name}\n", sha256_hex(b"tampered archive")).into_bytes(),
+            UpdateError::ChecksumMismatch,
+        ),
+    ];
+
+    for (label, checksums, expected) in cases {
+        let source = FakeSource::new()
+            .with_release_result(Ok(
+                parse_release_metadata(release_fixture()).expect("release fixture")
+            ))
+            .with_download_result(Ok(archive.clone()))
+            .with_download_result(Ok(checksums));
+        let installer = RecordingInstaller::default();
+        let temp = tempdir().expect("tempdir");
+        let binary_path = temp.path().join(current_binary_name());
+        std::fs::write(&binary_path, b"old").expect("seed binary");
+
+        let err =
+            match run_update_with_installer(&source, &options(&binary_path, false), &installer) {
+                Ok(_) => panic!("case {label} must fail"),
+                Err(err) => err,
+            };
+
+        assert_eq!(err, expected, "case {label}");
+        assert_eq!(source.download_calls(), 2, "case {label}");
+        assert_eq!(installer.calls(), 0, "case {label}");
+        assert_eq!(
+            std::fs::read(&binary_path).expect("read binary"),
+            b"old",
+            "case {label}"
+        );
+    }
+}
+
+#[test]
+fn checksum_mismatch_blocks_archive_validation_errors() {
+    let invalid_archive = vec![1, 2, 3, 4];
+    let source = FakeSource::new()
+        .with_release_result(Ok(
+            parse_release_metadata(release_fixture()).expect("release fixture")
+        ))
+        .with_download_result(Ok(invalid_archive))
+        .with_download_result(Ok(format!(
+            "{}  {}\n",
+            sha256_hex(b"different bytes"),
+            current_asset_name()
+        )
+        .into_bytes()));
+    let temp = tempdir().expect("tempdir");
+    let binary_path = temp.path().join(current_binary_name());
+    std::fs::write(&binary_path, b"old").expect("seed binary");
+
+    let err = run_update(&source, &options(&binary_path, true)).expect_err("must fail");
+
+    assert!(matches!(err, UpdateError::ChecksumMismatch));
+    assert_eq!(source.download_calls(), 2);
+    assert_eq!(std::fs::read(&binary_path).expect("read binary"), b"old");
+}
+
+#[test]
 fn update_stops_on_invalid_downloaded_archive() {
     let source = FakeSource::new()
         .with_release_result(Ok(
             parse_release_metadata(release_fixture()).expect("release fixture")
         ))
-        .with_download_result(Ok(vec![1, 2, 3, 4]));
+        .with_archive_and_valid_checksum(vec![1, 2, 3, 4]);
     let temp = tempdir().expect("tempdir");
     let binary_path = temp.path().join(current_binary_name());
     std::fs::write(&binary_path, b"old").expect("seed binary");
@@ -449,7 +669,7 @@ fn update_stops_on_invalid_downloaded_archive() {
         ),
         "expected archive validation error, got {err:?}"
     );
-    assert_eq!(source.download_calls(), 1);
+    assert_eq!(source.download_calls(), 2);
     assert_eq!(std::fs::read(&binary_path).expect("read binary"), b"old");
 }
 
@@ -459,7 +679,7 @@ fn dry_run_downloads_and_validates_without_replacement() {
         .with_release_result(Ok(
             parse_release_metadata(release_fixture()).expect("release fixture")
         ))
-        .with_download_result(Ok(download_archive_fixture()));
+        .with_valid_archive_downloads();
 
     let temp = tempdir().expect("tempdir");
     let binary_path = temp.path().join(current_binary_name());
@@ -468,6 +688,7 @@ fn dry_run_downloads_and_validates_without_replacement() {
     let result = run_update(&source, &options(&binary_path, true)).expect("dry-run succeeds");
 
     assert_eq!(result, expected_result(&binary_path, "validated"));
+    assert_eq!(source.download_calls(), 2);
     assert_eq!(std::fs::read(&binary_path).expect("read binary"), b"old");
 }
 
@@ -477,7 +698,7 @@ fn dry_run_rejects_corrupt_payload_before_reporting_validated() {
         .with_release_result(Ok(
             parse_release_metadata(release_fixture()).expect("release fixture")
         ))
-        .with_download_result(Ok(corrupt_download_archive_fixture()));
+        .with_archive_and_valid_checksum(corrupt_download_archive_fixture());
 
     let temp = tempdir().expect("tempdir");
     let binary_path = temp.path().join(current_binary_name());
@@ -495,7 +716,7 @@ fn dry_run_without_confirmation_is_allowed_and_still_fetches_release() {
         .with_release_result(Ok(
             parse_release_metadata(release_fixture()).expect("release fixture")
         ))
-        .with_download_result(Ok(download_archive_fixture()));
+        .with_valid_archive_downloads();
 
     let temp = tempdir().expect("tempdir");
     let binary_path = temp.path().join(current_binary_name());
@@ -507,7 +728,7 @@ fn dry_run_without_confirmation_is_allowed_and_still_fetches_release() {
     let result = run_update(&source, &update_options).expect("dry-run should not require --yes");
 
     assert_eq!(result, expected_result(&binary_path, "validated"));
-    assert_eq!(source.download_calls(), 1);
+    assert_eq!(source.download_calls(), 2);
     assert_eq!(std::fs::read(&binary_path).expect("read binary"), b"old");
 }
 
@@ -517,7 +738,7 @@ fn successful_update_replaces_binary_contents() {
         .with_release_result(Ok(
             parse_release_metadata(release_fixture()).expect("release fixture")
         ))
-        .with_download_result(Ok(download_archive_fixture()));
+        .with_valid_archive_downloads();
 
     let temp = tempdir().expect("tempdir");
     let binary_path = temp.path().join(current_binary_name());
@@ -526,6 +747,7 @@ fn successful_update_replaces_binary_contents() {
     let result = run_update(&source, &options(&binary_path, false)).expect("update succeeds");
 
     assert_eq!(result, expected_result(&binary_path, "updated"));
+    assert_eq!(source.download_calls(), 2);
     assert_eq!(
         std::fs::read(&binary_path).expect("read binary"),
         expected_updated_binary_bytes()
@@ -538,7 +760,7 @@ fn replacement_failure_restores_original_binary() {
         .with_release_result(Ok(
             parse_release_metadata(release_fixture()).expect("release fixture")
         ))
-        .with_download_result(Ok(download_archive_fixture()));
+        .with_valid_archive_downloads();
 
     let temp = tempdir().expect("tempdir");
     let binary_path = temp.path().join(current_binary_name());
@@ -563,7 +785,7 @@ fn update_preserves_existing_unix_permissions() {
         .with_release_result(Ok(
             parse_release_metadata(release_fixture()).expect("release fixture")
         ))
-        .with_download_result(Ok(download_archive_fixture()));
+        .with_valid_archive_downloads();
 
     let temp = tempdir().expect("tempdir");
     let binary_path = temp.path().join(current_binary_name());
@@ -633,6 +855,20 @@ fn download_archive_fixture() -> Vec<u8> {
     }
 }
 
+fn checksums_fixture_for_archive(archive: &[u8]) -> Vec<u8> {
+    let asset_name = current_asset_name();
+    format!("{}  {asset_name}\n", sha256_hex(archive)).into_bytes()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn current_asset_name() -> String {
+    let platform = current_platform().expect("supported platform for test host");
+    release_asset_name_for_tag("v1.2.3", &platform)
+}
+
 fn corrupt_download_archive_fixture() -> Vec<u8> {
     let (root, binary_name, archive_kind) = current_archive_root_and_binary();
     match archive_kind {
@@ -664,6 +900,28 @@ impl BinaryInstaller for FailingInstaller {
 }
 
 #[derive(Default)]
+struct RecordingInstaller {
+    calls: Mutex<usize>,
+}
+
+impl RecordingInstaller {
+    fn calls(&self) -> usize {
+        *self.calls.lock().expect("lock")
+    }
+}
+
+impl BinaryInstaller for RecordingInstaller {
+    fn replace_binary(
+        &self,
+        _current_executable: &Path,
+        _new_binary_bytes: &[u8],
+    ) -> Result<(), UpdateError> {
+        *self.calls.lock().expect("lock") += 1;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
 struct FakeSource {
     release_results: Mutex<VecDeque<Result<codex_image::updater::ReleaseMetadata, UpdateError>>>,
     download_results: Mutex<VecDeque<Result<Vec<u8>, UpdateError>>>,
@@ -689,6 +947,16 @@ impl FakeSource {
             .expect("lock")
             .push_back(result);
         self
+    }
+
+    fn with_valid_archive_downloads(self) -> Self {
+        self.with_archive_and_valid_checksum(download_archive_fixture())
+    }
+
+    fn with_archive_and_valid_checksum(self, archive: Vec<u8>) -> Self {
+        let checksums = checksums_fixture_for_archive(&archive);
+        self.with_download_result(Ok(archive))
+            .with_download_result(Ok(checksums))
     }
 
     fn download_calls(&self) -> usize {
@@ -767,6 +1035,10 @@ fn release_fixture() -> &'static str {
             {
                 "name": "codex-image-v1.2.3-x86_64-pc-windows-msvc.zip",
                 "browser_download_url": "https://example.invalid/windows"
+            },
+            {
+                "name": "SHA256SUMS",
+                "browser_download_url": "https://example.invalid/SHA256SUMS"
             }
         ]
     }"#
