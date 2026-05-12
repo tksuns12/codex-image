@@ -4,9 +4,9 @@ use codex_image::config::ConfigError;
 use codex_image::diagnostics::{CliError, ExitCode};
 use codex_image::generation_diagnostics::{
     write_generation_diagnostics, BatchDiagnosticsSummary, CodexRunDiagnostics, CodexRunStatus,
-    FinalMessageDiagnostics, FinalMessageStatus, GenerationDiagnostics,
+    FinalMessageDiagnostics, FinalMessageFieldStatus, GenerationDiagnostics,
     GenerationDiagnosticsMetadata, GenerationDiagnosticsMode, GenerationDiagnosticsResult,
-    GenerationDiagnosticsStdoutMode, PromptSourceKind, RedactedFailure,
+    GenerationDiagnosticsStdoutMode, PromptSourceKind, SanitizedCommand,
     GENERATION_DIAGNOSTICS_SCHEMA, GENERATION_DIAGNOSTICS_SCHEMA_VERSION,
 };
 use codex_image::updater::UpdateError;
@@ -74,16 +74,19 @@ fn sample_generation_diagnostics() -> GenerationDiagnostics {
         failed_count: 1,
     })
     .with_failure(&leaked_source)
-    .with_runs(vec![CodexRunDiagnostics {
-        index: 1,
-        status: CodexRunStatus::FinalMessageInvalid,
-        elapsed_millis: Some(42),
-        exit_code: Some(1),
-        final_message: FinalMessageDiagnostics {
-            status: FinalMessageStatus::InvalidJson,
-        },
-        failure: Some(RedactedFailure::from_cli_error(&leaked_source)),
-    }])
+    .with_runs(vec![CodexRunDiagnostics::failure(
+        1,
+        Some(1),
+        300,
+        42,
+        Some(1),
+        CodexRunStatus::FinalMessageInvalid,
+        FinalMessageDiagnostics::contract_invalid(
+            FinalMessageFieldStatus::Present,
+            FinalMessageFieldStatus::Present,
+        ),
+        &leaked_source,
+    )])
 }
 
 #[test]
@@ -101,11 +104,20 @@ fn diagnostics_debug_diagnostics_schema_v1_serializes_only_sanitized_fields() {
     assert_eq!(json["metadata"]["result"], "failure");
     assert_eq!(json["metadata"]["prompt_source"], "prompt_file");
     assert_eq!(json["metadata"]["stdout_mode"], "json");
-    assert_eq!(json["metadata"]["command"]["program"], "[codex-binary]");
+    assert_eq!(json["metadata"]["command"]["program"], "codex");
+    assert_eq!(
+        json["metadata"]["command"],
+        serde_json::to_value(SanitizedCommand::codex_subprocess()).unwrap()
+    );
     assert_eq!(json["batch"]["prompt_count"], 2);
     assert_eq!(json["failure"]["code"], "api.codex_image_generation_failed");
+    assert_eq!(json["runs"][0]["phase"], "generate_image");
+    assert_eq!(json["runs"][0]["outcome"], "failed");
     assert_eq!(json["runs"][0]["status"], "final_message_invalid");
-    assert_eq!(json["runs"][0]["final_message"]["status"], "invalid_json");
+    assert_eq!(
+        json["runs"][0]["final_message"]["status"],
+        "contract_invalid"
+    );
     assert_eq!(json["redaction"]["prompt_text"], "omitted");
 
     for forbidden in [

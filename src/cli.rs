@@ -6,9 +6,15 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use crate::codex::{
-    generate_image_with_codex_with_options, CodexGenerationOptions, DEFAULT_CODEX_EXEC_TIMEOUT_SECS,
+    generate_image_with_codex_with_options, CodexDiagnosticsRecorder, CodexGenerationOptions,
+    DEFAULT_CODEX_EXEC_TIMEOUT_SECS,
 };
 use crate::diagnostics::CliError;
+use crate::generation_diagnostics::{
+    write_generation_diagnostics, GenerationDiagnostics, GenerationDiagnosticsMetadata,
+    GenerationDiagnosticsMode, GenerationDiagnosticsResult, GenerationDiagnosticsStdoutMode,
+    PromptSourceKind,
+};
 use crate::output::{
     remove_batch_manifest_if_exists, write_batch_generation_manifest,
     write_generation_output_from_sources, BatchGenerationManifest, GeneratedImageSource,
@@ -67,6 +73,17 @@ impl OutputArgs {
 
     const fn should_emit_stdout(self) -> bool {
         !self.quiet
+    }
+
+    const fn diagnostics_stdout_mode(self) -> GenerationDiagnosticsStdoutMode {
+        if self.quiet {
+            GenerationDiagnosticsStdoutMode::Quiet
+        } else {
+            match self.output {
+                OutputMode::Human => GenerationDiagnosticsStdoutMode::Human,
+                OutputMode::Json => GenerationDiagnosticsStdoutMode::Json,
+            }
+        }
     }
 }
 
@@ -335,35 +352,122 @@ fn generate(
     prompt_file: Option<PathBuf>,
     out: PathBuf,
     timeout: u64,
-    _debug_diagnostics: Option<PathBuf>,
+    debug_diagnostics: Option<PathBuf>,
     output: OutputArgs,
 ) -> Result<(), CliError> {
-    let timeout = std::time::Duration::from_secs(timeout);
-
-    let result = match (prompt, prompt_file) {
-        (Some(prompt), None) => {
-            GenerateSuccessOutput::Single(generate_single_prompt(&prompt, &out, timeout)?)
-        }
-        (None, Some(prompt_file)) => {
-            GenerateSuccessOutput::Batch(generate_prompt_batch(&prompt_file, &out, timeout)?)
-        }
-        _ => return Err(CliError::Unknown),
+    let timeout_duration = std::time::Duration::from_secs(timeout);
+    let Some((mode, prompt_source)) = generation_invocation_kind(&prompt, &prompt_file) else {
+        return Err(CliError::Unknown);
     };
 
-    if output.should_emit_stdout() {
-        match output.effective_mode() {
-            OutputMode::Json => {
-                let line =
-                    serde_json::to_string(&result).map_err(|_| CliError::OutputWriteFailed)?;
-                println!("{line}");
+    let recorder = debug_diagnostics
+        .as_ref()
+        .map(|_| CodexDiagnosticsRecorder::new(None));
+
+    let generation_result = match (prompt, prompt_file) {
+        (Some(prompt), None) => {
+            generate_single_prompt(&prompt, &out, timeout_duration, recorder.clone())
+                .map(GenerateSuccessOutput::Single)
+        }
+        (None, Some(prompt_file)) => generate_prompt_batch(&prompt_file, &out, timeout_duration)
+            .map(GenerateSuccessOutput::Batch),
+        _ => Err(CliError::Unknown),
+    };
+
+    let runs = recorder
+        .as_ref()
+        .map(CodexDiagnosticsRecorder::runs)
+        .unwrap_or_default();
+
+    match generation_result {
+        Ok(result) => {
+            if let Some(path) = debug_diagnostics.as_ref() {
+                let diagnostics = build_generation_diagnostics(
+                    mode,
+                    GenerationDiagnosticsResult::Success,
+                    prompt_source,
+                    output,
+                    timeout,
+                    runs,
+                    None,
+                );
+                write_generation_diagnostics(path, &diagnostics)?;
             }
-            OutputMode::Human => {
-                println!("{}", format_generate_result_human(&result, &out));
+
+            if output.should_emit_stdout() {
+                match output.effective_mode() {
+                    OutputMode::Json => {
+                        let line = serde_json::to_string(&result)
+                            .map_err(|_| CliError::OutputWriteFailed)?;
+                        println!("{line}");
+                    }
+                    OutputMode::Human => {
+                        println!("{}", format_generate_result_human(&result, &out));
+                    }
+                }
             }
+
+            Ok(())
+        }
+        Err(err) => {
+            if let Some(path) = debug_diagnostics.as_ref() {
+                let diagnostics = build_generation_diagnostics(
+                    mode,
+                    GenerationDiagnosticsResult::Failure,
+                    prompt_source,
+                    output,
+                    timeout,
+                    runs,
+                    Some(&err),
+                );
+                let _ = write_generation_diagnostics(path, &diagnostics);
+            }
+            Err(err)
         }
     }
+}
 
-    Ok(())
+fn generation_invocation_kind(
+    prompt: &Option<String>,
+    prompt_file: &Option<PathBuf>,
+) -> Option<(GenerationDiagnosticsMode, PromptSourceKind)> {
+    match (prompt, prompt_file) {
+        (Some(_), None) => Some((
+            GenerationDiagnosticsMode::Single,
+            PromptSourceKind::PositionalPrompt,
+        )),
+        (None, Some(_)) => Some((
+            GenerationDiagnosticsMode::Batch,
+            PromptSourceKind::PromptFile,
+        )),
+        _ => None,
+    }
+}
+
+fn build_generation_diagnostics(
+    mode: GenerationDiagnosticsMode,
+    result: GenerationDiagnosticsResult,
+    prompt_source: PromptSourceKind,
+    output: OutputArgs,
+    timeout_seconds: u64,
+    runs: Vec<crate::generation_diagnostics::CodexRunDiagnostics>,
+    failure: Option<&CliError>,
+) -> GenerationDiagnostics {
+    let mut diagnostics =
+        GenerationDiagnostics::new(GenerationDiagnosticsMetadata::for_invocation(
+            mode,
+            result,
+            prompt_source,
+            output.diagnostics_stdout_mode(),
+            timeout_seconds,
+        ))
+        .with_runs(runs);
+
+    if let Some(failure) = failure {
+        diagnostics = diagnostics.with_failure(failure);
+    }
+
+    diagnostics
 }
 
 #[derive(Debug, Serialize)]
@@ -377,9 +481,14 @@ fn generate_single_prompt(
     prompt: &str,
     out: &Path,
     timeout: std::time::Duration,
+    diagnostics: Option<CodexDiagnosticsRecorder>,
 ) -> Result<GenerationManifest, CliError> {
-    let generated =
-        generate_image_with_codex_with_options(prompt, out, CodexGenerationOptions { timeout })?;
+    let mut options = CodexGenerationOptions::new(timeout);
+    if let Some(diagnostics) = diagnostics {
+        options = options.with_diagnostics(diagnostics);
+    }
+
+    let generated = generate_image_with_codex_with_options(prompt, out, options)?;
     let source =
         GeneratedImageSource::trusted_after(generated.source_path, generated.source_not_before);
 
@@ -398,7 +507,7 @@ fn generate_prompt_batch(
     let mut item_manifests = Vec::with_capacity(prompts.len());
     for (index, prompt) in prompts.iter().enumerate() {
         let item_out_dir = out.join(format!("item-{item_index:04}", item_index = index + 1));
-        let item_manifest = generate_single_prompt(prompt, &item_out_dir, timeout)?;
+        let item_manifest = generate_single_prompt(prompt, &item_out_dir, timeout, None)?;
         item_manifests.push(item_manifest);
     }
 
