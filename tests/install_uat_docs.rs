@@ -465,9 +465,38 @@ fn install_uat_docs_scripts_document_codex_backend_and_live_guard() {
         ],
     );
 
-    must_contain(verify_label, verify_local_install, "generate --help");
-    must_contain(live_label, uat_live_smoke, "CODEX_IMAGE_RUN_LIVE=1");
-    must_contain(live_label, uat_live_smoke, "CODEX_IMAGE_CODEX_BIN");
+    assert_all_present(
+        verify_label,
+        verify_local_install,
+        &[
+            "generate --help",
+            "'--out'",
+            "'--output'",
+            "'--quiet'",
+            "'--prompt-file'",
+            "'--timeout'",
+            "'--debug-diagnostics'",
+            "status --json",
+            "login --help",
+            "logout --help",
+        ],
+    );
+
+    let live_generate_command =
+        "generate \"UAT smoke image from codex-image\" --out \"$out_dir\" --output json";
+    assert_all_present(
+        live_label,
+        uat_live_smoke,
+        &[
+            "CODEX_IMAGE_RUN_LIVE=1",
+            "CODEX_IMAGE_CODEX_BIN",
+            live_generate_command,
+            "json.load(fh)",
+            "manifest_path",
+            "cli-stderr-redacted",
+        ],
+    );
+    assert_before(live_label, uat_live_smoke, live_generate_command, "json.load(fh)");
 
     assert_all_absent(
         live_label,
@@ -489,7 +518,17 @@ fn install_uat_docs_uat_doc_describes_codex_only_backend() {
     assert_all_present(
         label,
         runbook,
-        &["Codex", "generate", "CODEX_IMAGE_CODEX_BIN"],
+        &[
+            "Codex",
+            "generate",
+            "CODEX_IMAGE_CODEX_BIN",
+            "CODEX_IMAGE_RUN_LIVE=1 bash scripts/uat-live-smoke.sh",
+            "generate \"UAT smoke image from codex-image\" --out <temp-out> --output json",
+            "Parses stdout JSON (explicitly emitted by `--output json`) and validates",
+            "manifest_path",
+            "phase=generate",
+            "redacted CLI stderr envelope",
+        ],
     );
 
     assert_all_absent(
@@ -500,6 +539,7 @@ fn install_uat_docs_uat_doc_describes_codex_only_backend() {
             "CODEX_IMAGE_API_BASE_URL",
             "status --json",
             "OAuth",
+            "CODEX_IMAGE_RUN_LIVE=0",
         ],
     );
 }
