@@ -465,6 +465,7 @@ fn generation_invocation_kind(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_generation_diagnostics(
     mode: GenerationDiagnosticsMode,
     result: GenerationDiagnosticsResult,
@@ -841,6 +842,7 @@ fn skill_command(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn skill_command_with_selector(
     operation: SkillCommandOperation,
     tools: &[ToolArg],
