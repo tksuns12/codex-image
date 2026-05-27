@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -52,7 +52,7 @@ jobs:
     steps:
       - name: Create or update release PR
         id: release
-        uses: googleapis/release-please-action@v4
+        uses: googleapis/release-please-action@v5
         with:
           release-type: rust
           target-branch: release
@@ -76,7 +76,7 @@ jobs:
             target: x86_64-pc-windows-msvc
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -115,7 +115,7 @@ jobs:
           "ASSET_PATH=dist/$asset.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload release archive artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-archive-${{ matrix.target }}
           path: ${{ env.ASSET_PATH }}
@@ -131,7 +131,7 @@ jobs:
       contents: write
     steps:
       - name: Download release archive artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-archive-*
           path: dist
