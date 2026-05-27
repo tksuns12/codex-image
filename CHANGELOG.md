@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.0](https://github.com/tksuns12/codex-image/compare/v0.3.0...v0.4.0) (2026-05-27)
+
+
+### Features
+
+* Added `generate --timeout <SECS>` with positive-value clap valida… ([c227164](https://github.com/tksuns12/codex-image/commit/c2271642a285ba4f184e13e217e8dd7536ae8cdc))
+* Added prompt-file batch generation to `codex-image generate` with… ([f139b9e](https://github.com/tksuns12/codex-image/commit/f139b9ef205e47b549bcd9e49adbc976c0f807e8))
+* Enforce updater SHA256SUMS verification ([cd5322e](https://github.com/tksuns12/codex-image/commit/cd5322e75438db3f16e548394f138dc2e79a3780))
+* Made `update` success output mode-aware (human/json/quiet) at the… ([9d2102f](https://github.com/tksuns12/codex-image/commit/9d2102f5d779ba3591665bd92b34911a11c48007))
+* Refreshed managed codex-image skill guidance for M005 automation… ([20f1af3](https://github.com/tksuns12/codex-image/commit/20f1af3cc2bbf933cc5c608969cd6028465a5aa4))
+* Validated and finalized skill install success rendering so it emi… ([6460172](https://github.com/tksuns12/codex-image/commit/6460172fad6cc408239bf676a2b58a523e530152))
+* Wire single-generation diagnostics through Codex subprocess telem… ([a4f4847](https://github.com/tksuns12/codex-image/commit/a4f48475d76752ea91c704a6b2d9b8aef5b13a36))
+
+
+### Bug Fixes
+
+* Ran the full S03 regression gate, fixed a formatting regression in… ([88d9a45](https://github.com/tksuns12/codex-image/commit/88d9a4596605ddcaa9ddb3bd40e6424df39eeafb))
+* Ran the full timeout-focused + full-suite proof, fixed the only re… ([47c6cf1](https://github.com/tksuns12/codex-image/commit/47c6cf18fcc0e0c2115a1e2668ce11e1bf528841))
+
 ## [0.3.0](https://github.com/tksuns12/codex-image/compare/v0.2.1...v0.3.0) (2026-05-07)
 
 
