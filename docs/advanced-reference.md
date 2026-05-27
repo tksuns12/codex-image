@@ -12,6 +12,7 @@ Use this section when wiring `codex-image` into scripts or agent workflows.
 
 - The default success output is human-readable.
 - `--output json` emits one aggregate JSON object on success.
+- `--output json` success output and each `manifest.json` embed the raw prompt text per item; treat JSON stdout and manifests as sensitive output. Prefer `--quiet` over `--output json` when prompts must not reach captured stdout or logs.
 - `--quiet` suppresses success stdout; errors still go to stderr.
 - Non-clap failures use a centralized redacted error envelope on stderr with an error code, message, recoverability flag, and hint.
 
@@ -54,6 +55,8 @@ Prompt-file rules:
 - If a later item fails, completed item directories remain for inspection.
 
 The success JSON for batch mode is the same aggregate object written to the root manifest. It includes the prompt file, item count, per-item output directories, per-item manifest paths, images, and sanitized response metadata.
+
+Single-prompt and batch JSON success output is printed to stdout and mirrors the on-disk `manifest.json`, including the raw prompt text for every item. Unlike the diagnostics sidecar, this JSON is not redacted. When an agent or CI job captures stdout, prefer `--quiet` so prompts stay out of logs, or treat the JSON and manifests as sensitive data.
 
 ## Timeout and source-path trust boundary
 

@@ -71,6 +71,8 @@ Use this skill when you need a reproducible image-generation workflow through th
 - `--prompt-file` reads one prompt per line; blank lines and lines beginning with `#` are skipped.
 - Batch items are written under `item-0001/`, `item-0002/`, and so on.
 - The root `manifest.json` is written only after every item succeeds.
+- `--output json` success output and each `manifest.json` embed the raw prompt text per item; treat JSON stdout and manifests as sensitive output.
+- Prefer `--quiet` over `--output json` when prompts must not reach captured stdout or logs.
 - `--timeout <secs>` is a positive local codex subprocess timeout.
 - When `--quiet` is used, rely on generated files and exit status.
 - `--debug-diagnostics <file>` writes a local diagnostics sidecar.

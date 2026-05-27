@@ -112,6 +112,8 @@ fn skill_installer_content_includes_automation_contract_concepts() {
         "diagnostics are sanitized/redacted",
         "not a raw codex transcript",
         "when `--quiet` is used, rely on generated files and exit status",
+        "embed the raw prompt text per item; treat json stdout and manifests as sensitive output",
+        "prefer `--quiet` over `--output json` when prompts must not reach captured stdout or logs",
     ] {
         assert!(
             body.contains(phrase),
