@@ -238,6 +238,8 @@ fn install_uat_docs_advanced_reference_covers_post_first_run_operations() {
             "codex-image skill update --tool codex --scope project --yes",
             "default success output is human-readable",
             "`--output json` emits one aggregate JSON object on success",
+            "embed the raw prompt text per item; treat JSON stdout and manifests as sensitive output",
+            "Unlike the diagnostics sidecar, this JSON is not redacted",
             "`--quiet` suppresses success stdout; errors still go to stderr",
             "centralized redacted error envelope",
             "JSON output is one object with `operation` and `results`",
