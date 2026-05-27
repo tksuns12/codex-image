@@ -85,6 +85,10 @@ fn release_workflow_builds_expected_platform_artifacts() {
         "release workflow reruns should replace existing failed-run artifacts"
     );
     assert!(
+        workflow.contains("GH_REPO: ${{ github.repository }}"),
+        "publish job must set GH_REPO so gh resolves the repo without a git checkout"
+    );
+    assert!(
         !workflow.contains("Compress-Archive -Path \"$packageDir/*\""),
         "windows archive packaging must not flatten the package root via $packageDir/*"
     );
