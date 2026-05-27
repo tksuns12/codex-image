@@ -1,9 +1,10 @@
 use std::fs;
 
 use codex_image::skill_installer::{
-    classify_skill_content, classify_skill_path, install_skill, managed_checksum, managed_marker_line,
-    render_managed_skill_content, render_skill_body, uninstall_skill, SkillContentClassification,
-    SkillInstallOptions, SkillInstallPlan, SkillInstallStatus, SkillUninstallStatus,
+    classify_skill_content, classify_skill_path, install_skill, managed_checksum,
+    managed_marker_line, render_managed_skill_content, render_skill_body, uninstall_skill,
+    SkillContentClassification, SkillInstallOptions, SkillInstallPlan, SkillInstallStatus,
+    SkillUninstallStatus,
 };
 use codex_image::skills::{resolve_skill_path, SkillScope, SupportedTool};
 use tempfile::tempdir;
@@ -16,7 +17,10 @@ fn skill_installer_content_includes_frontmatter_and_required_headings() {
         body.starts_with("---\nname: codex-image\n"),
         "skill body must start with codex-image frontmatter"
     );
-    assert!(body.ends_with('\n'), "skill body must end with trailing newline");
+    assert!(
+        body.ends_with('\n'),
+        "skill body must end with trailing newline"
+    );
     assert!(
         body.contains("description:"),
         "skill body must include frontmatter description"
@@ -78,22 +82,44 @@ fn skill_installer_content_includes_prompting_checklist_concepts() {
 fn skill_installer_content_includes_expected_command_guidance() {
     let body = render_skill_body();
 
-    assert!(
-        body.contains("codex-image generate \"<prompt>\" --out <dir>"),
-        "skill body must describe the generate command: codex-image generate \"<prompt>\" --out <dir>"
-    );
-    assert!(
-        body.contains(
-            "codex-image skill install --tool <claude|claude-code|codex|pi|opencode> --scope <global|project> --yes"
-        ),
-        "skill body must describe the non-interactive install command"
-    );
-    assert!(
-        body.contains(
-            "codex-image skill update --tool <claude|claude-code|codex|pi|opencode> --scope <global|project> --yes"
-        ),
-        "skill body must describe the non-interactive update command"
-    );
+    for command in [
+        "codex-image generate \"<prompt>\" --out <dir> --output json",
+        "codex-image generate --prompt-file ./prompts.txt --out <dir> --output json --timeout 120",
+        "codex-image generate --prompt-file ./prompts.txt --out <dir> --output json --debug-diagnostics ./diagnostics.json",
+        "codex-image generate \"<prompt>\" --out <dir> --quiet",
+    ] {
+        assert!(
+            body.contains(command),
+            "skill body must retain automation command example: {command}"
+        );
+    }
+}
+
+#[test]
+fn skill_installer_content_includes_automation_contract_concepts() {
+    let body = render_skill_body().to_ascii_lowercase();
+
+    for phrase in [
+        "--output json",
+        "--quiet",
+        "--prompt-file",
+        "--timeout",
+        "--debug-diagnostics",
+        "item-0001",
+        "blank lines and lines beginning with `#` are skipped",
+        "root `manifest.json` is written only after every item succeeds",
+        "local codex subprocess timeout",
+        "diagnostics are sanitized/redacted",
+        "not a raw codex transcript",
+        "when `--quiet` is used, rely on generated files and exit status",
+        "embed the raw prompt text per item; treat json stdout and manifests as sensitive output",
+        "prefer `--quiet` over `--output json` when prompts must not reach captured stdout or logs",
+    ] {
+        assert!(
+            body.contains(phrase),
+            "skill body must retain automation contract phrase: {phrase}"
+        );
+    }
 }
 
 #[test]
@@ -173,13 +199,15 @@ fn skill_installer_content_is_deterministic_bytes_and_checksum() {
         .copied()
         .expect("managed content must not be empty");
     assert_eq!(
-        first_byte,
-        b'-',
+        first_byte, b'-',
         "managed content byte 1 must begin frontmatter markdown"
     );
 
     let first_line = first.lines().next().expect("first line exists");
-    assert_eq!(first_line, "---", "managed skill must start with frontmatter");
+    assert_eq!(
+        first_line, "---",
+        "managed skill must start with frontmatter"
+    );
     assert!(
         first.ends_with('\n'),
         "managed skill content must end with a trailing newline"
@@ -507,7 +535,8 @@ fn skill_installer_filesystem_uninstall_deletes_managed_and_missing_is_noop() {
         project.path(),
     );
 
-    let missing = uninstall_skill(&plan, SkillInstallOptions::default()).expect("missing uninstall");
+    let missing =
+        uninstall_skill(&plan, SkillInstallOptions::default()).expect("missing uninstall");
     assert_eq!(missing.status, SkillUninstallStatus::AlreadyMissing);
 
     let created = install_skill(&plan, SkillInstallOptions::default()).expect("install managed");
@@ -534,8 +563,12 @@ fn skill_installer_filesystem_uninstall_blocks_manual_or_tampered_without_force(
     fs::create_dir_all(parent).expect("create parent");
 
     fs::write(plan.target_path(), "# manual skill\n").expect("seed manual skill");
-    let blocked_manual = uninstall_skill(&plan, SkillInstallOptions::default()).expect("manual blocked");
-    assert_eq!(blocked_manual.status, SkillUninstallStatus::BlockedManualEdit);
+    let blocked_manual =
+        uninstall_skill(&plan, SkillInstallOptions::default()).expect("manual blocked");
+    assert_eq!(
+        blocked_manual.status,
+        SkillUninstallStatus::BlockedManualEdit
+    );
     assert!(plan.target_path().exists());
 
     let tampered = render_managed_skill_content().replacen(
@@ -544,8 +577,12 @@ fn skill_installer_filesystem_uninstall_blocks_manual_or_tampered_without_force(
         1,
     );
     fs::write(plan.target_path(), tampered).expect("seed tampered managed skill");
-    let blocked_tampered = uninstall_skill(&plan, SkillInstallOptions::default()).expect("tampered blocked");
-    assert_eq!(blocked_tampered.status, SkillUninstallStatus::BlockedManualEdit);
+    let blocked_tampered =
+        uninstall_skill(&plan, SkillInstallOptions::default()).expect("tampered blocked");
+    assert_eq!(
+        blocked_tampered.status,
+        SkillUninstallStatus::BlockedManualEdit
+    );
     assert!(plan.target_path().exists());
 }
 
@@ -564,7 +601,8 @@ fn skill_installer_filesystem_uninstall_force_deletes_protected_content() {
     fs::create_dir_all(parent).expect("create parent");
     fs::write(plan.target_path(), "# manual skill\n").expect("seed manual content");
 
-    let result = uninstall_skill(&plan, SkillInstallOptions { force: true }).expect("forced delete");
+    let result =
+        uninstall_skill(&plan, SkillInstallOptions { force: true }).expect("forced delete");
     assert_eq!(result.status, SkillUninstallStatus::ForcedDelete);
     assert!(!plan.target_path().exists());
 }

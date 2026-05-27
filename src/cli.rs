@@ -2,12 +2,24 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
-use crate::codex::generate_image_with_codex;
+use crate::codex::{
+    generate_image_with_codex_with_options, CodexDiagnosticsRecorder, CodexGenerationOptions,
+    DEFAULT_CODEX_EXEC_TIMEOUT_SECS,
+};
 use crate::diagnostics::CliError;
-use crate::output::write_generation_output_from_files;
+use crate::generation_diagnostics::{
+    write_generation_diagnostics, BatchDiagnosticsSummary, GenerationDiagnostics,
+    GenerationDiagnosticsMetadata, GenerationDiagnosticsMode, GenerationDiagnosticsResult,
+    GenerationDiagnosticsStdoutMode, PromptSourceKind,
+};
+use crate::output::{
+    remove_batch_manifest_if_exists, write_batch_generation_manifest,
+    write_generation_output_from_sources, BatchGenerationManifest, GeneratedImageSource,
+    GenerationManifest,
+};
 use crate::skill_install_ux::{
     expand_selected_targets, interactive_target_options, select_interactive_targets,
     DialoguerTargetSelector, InstallTargetSelector, InteractiveSelectionError,
@@ -33,15 +45,79 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum OutputMode {
+    #[default]
+    Human,
+    Json,
+}
+
+#[derive(Args, Clone, Copy, Debug, Default)]
+struct OutputArgs {
+    /// Success output mode. Human-readable text by default; JSON is stable for automation.
+    #[arg(long, value_enum, default_value_t = OutputMode::Human)]
+    output: OutputMode,
+    /// Suppress success stdout output. Errors are still emitted on stderr.
+    #[arg(long, default_value_t = false)]
+    quiet: bool,
+}
+
+impl OutputArgs {
+    const fn effective_mode(self) -> OutputMode {
+        if self.quiet {
+            OutputMode::Human
+        } else {
+            self.output
+        }
+    }
+
+    const fn should_emit_stdout(self) -> bool {
+        !self.quiet
+    }
+
+    const fn diagnostics_stdout_mode(self) -> GenerationDiagnosticsStdoutMode {
+        if self.quiet {
+            GenerationDiagnosticsStdoutMode::Quiet
+        } else {
+            match self.output {
+                OutputMode::Human => GenerationDiagnosticsStdoutMode::Human,
+                OutputMode::Json => GenerationDiagnosticsStdoutMode::Json,
+            }
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Generate image artifacts and a manifest for the provided prompt via installed Codex.
     Generate {
         /// Prompt text passed to Codex's built-in image generation tool.
-        prompt: String,
+        #[arg(value_name = "PROMPT", required_unless_present = "prompt_file")]
+        prompt: Option<String>,
+        /// Line-based prompt file for sequential batch generation.
+        #[arg(
+            long,
+            value_name = "FILE",
+            required_unless_present = "prompt",
+            conflicts_with = "prompt"
+        )]
+        prompt_file: Option<PathBuf>,
         /// Output directory where generated image files and manifest.json are written.
         #[arg(long, value_name = "DIR")]
         out: PathBuf,
+        /// Local Codex subprocess timeout in seconds.
+        #[arg(
+            long,
+            value_name = "SECS",
+            value_parser = parse_positive_timeout_secs,
+            default_value_t = DEFAULT_CODEX_EXEC_TIMEOUT_SECS
+        )]
+        timeout: u64,
+        /// Write a sanitized debug diagnostics sidecar JSON file.
+        #[arg(long, value_name = "FILE")]
+        debug_diagnostics: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Update codex-image to the latest GitHub Release archive for the current platform.
     Update {
@@ -54,6 +130,8 @@ enum Commands {
         /// Optional GitHub Release tag (for example: v1.2.3). Defaults to latest when omitted.
         #[arg(long = "version", value_name = "TAG", value_parser = parse_release_tag)]
         version: Option<String>,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Manage codex-image native skill installation paths.
     Skill {
@@ -79,6 +157,8 @@ enum SkillCommands {
         /// Overwrite manual or tampered existing content.
         #[arg(long, default_value_t = false)]
         force: bool,
+        #[command(flatten)]
+        output: OutputArgs,
     },
     /// Refresh managed codex-image SKILL.md files for selected supported tool/scope targets.
     /// No-ops current managed files and protects manual edits unless --force is passed.
@@ -96,6 +176,8 @@ enum SkillCommands {
         /// Overwrite manual or tampered existing content.
         #[arg(long, default_value_t = false)]
         force: bool,
+        #[command(flatten)]
+        output: OutputArgs,
     },
 }
 
@@ -145,6 +227,13 @@ enum SkillCommandOperation {
 }
 
 impl SkillCommandOperation {
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::Install => "install",
+            Self::Update => "update",
+        }
+    }
+
     const fn missing_confirmation_error(self) -> CliError {
         match self {
             Self::Install => CliError::MissingInstallConfirmation,
@@ -240,31 +329,346 @@ pub fn run() -> i32 {
 
 fn dispatch(cli: Cli) -> Result<(), CliError> {
     match cli.command {
-        Commands::Generate { prompt, out } => generate(prompt, out),
+        Commands::Generate {
+            prompt,
+            prompt_file,
+            out,
+            timeout,
+            debug_diagnostics,
+            output,
+        } => generate(prompt, prompt_file, out, timeout, debug_diagnostics, output),
         Commands::Update {
             yes,
             dry_run,
             version,
-        } => update(yes, dry_run, version),
+            output,
+        } => update(yes, dry_run, version, output),
         Commands::Skill { command } => dispatch_skill(command),
     }
 }
 
-fn generate(prompt: String, out: PathBuf) -> Result<(), CliError> {
-    let generated = generate_image_with_codex(&prompt, &out)?;
-    let manifest = write_generation_output_from_files(
-        &prompt,
-        GPT_IMAGE_MODEL,
-        &out,
-        &[generated.source_path],
-    )?;
-    let line = serde_json::to_string(&manifest).map_err(|_| CliError::OutputWriteFailed)?;
-    println!("{line}");
+fn generate(
+    prompt: Option<String>,
+    prompt_file: Option<PathBuf>,
+    out: PathBuf,
+    timeout: u64,
+    debug_diagnostics: Option<PathBuf>,
+    output: OutputArgs,
+) -> Result<(), CliError> {
+    let timeout_duration = std::time::Duration::from_secs(timeout);
+    let Some((mode, prompt_source)) = generation_invocation_kind(&prompt, &prompt_file) else {
+        return Err(CliError::Unknown);
+    };
 
-    Ok(())
+    let recorder = debug_diagnostics
+        .as_ref()
+        .map(|_| CodexDiagnosticsRecorder::new(None));
+    let mut batch_summary = if mode == GenerationDiagnosticsMode::Batch {
+        Some(BatchDiagnosticsSummary {
+            planned_items: 0,
+            completed_items: 0,
+            failed_item_index: None,
+        })
+    } else {
+        None
+    };
+
+    let generation_result = match (prompt, prompt_file) {
+        (Some(prompt), None) => {
+            generate_single_prompt(&prompt, &out, timeout_duration, recorder.clone())
+                .map(GenerateSuccessOutput::Single)
+        }
+        (None, Some(prompt_file)) => {
+            match generate_prompt_batch(&prompt_file, &out, timeout_duration, recorder.as_ref()) {
+                Ok((manifest, summary)) => {
+                    batch_summary = Some(summary);
+                    Ok(GenerateSuccessOutput::Batch(manifest))
+                }
+                Err(batch_failure) => {
+                    batch_summary = Some(batch_failure.summary);
+                    Err(batch_failure.error)
+                }
+            }
+        }
+        _ => Err(CliError::Unknown),
+    };
+
+    let runs = recorder
+        .as_ref()
+        .map(CodexDiagnosticsRecorder::runs)
+        .unwrap_or_default();
+
+    match generation_result {
+        Ok(result) => {
+            if let Some(path) = debug_diagnostics.as_ref() {
+                let diagnostics = build_generation_diagnostics(
+                    mode,
+                    GenerationDiagnosticsResult::Success,
+                    prompt_source,
+                    output,
+                    timeout,
+                    runs,
+                    batch_summary,
+                    None,
+                );
+                write_generation_diagnostics(path, &diagnostics)?;
+            }
+
+            if output.should_emit_stdout() {
+                match output.effective_mode() {
+                    OutputMode::Json => {
+                        let line = serde_json::to_string(&result)
+                            .map_err(|_| CliError::OutputWriteFailed)?;
+                        println!("{line}");
+                    }
+                    OutputMode::Human => {
+                        println!("{}", format_generate_result_human(&result, &out));
+                    }
+                }
+            }
+
+            Ok(())
+        }
+        Err(err) => {
+            if let Some(path) = debug_diagnostics.as_ref() {
+                let diagnostics = build_generation_diagnostics(
+                    mode,
+                    GenerationDiagnosticsResult::Failure,
+                    prompt_source,
+                    output,
+                    timeout,
+                    runs,
+                    batch_summary,
+                    Some(&err),
+                );
+                write_generation_diagnostics(path, &diagnostics)?;
+            }
+            Err(err)
+        }
+    }
 }
 
-fn update(yes: bool, dry_run: bool, version: Option<String>) -> Result<(), CliError> {
+fn generation_invocation_kind(
+    prompt: &Option<String>,
+    prompt_file: &Option<PathBuf>,
+) -> Option<(GenerationDiagnosticsMode, PromptSourceKind)> {
+    match (prompt, prompt_file) {
+        (Some(_), None) => Some((
+            GenerationDiagnosticsMode::Single,
+            PromptSourceKind::PositionalPrompt,
+        )),
+        (None, Some(_)) => Some((
+            GenerationDiagnosticsMode::Batch,
+            PromptSourceKind::PromptFile,
+        )),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_generation_diagnostics(
+    mode: GenerationDiagnosticsMode,
+    result: GenerationDiagnosticsResult,
+    prompt_source: PromptSourceKind,
+    output: OutputArgs,
+    timeout_seconds: u64,
+    runs: Vec<crate::generation_diagnostics::CodexRunDiagnostics>,
+    batch_summary: Option<BatchDiagnosticsSummary>,
+    failure: Option<&CliError>,
+) -> GenerationDiagnostics {
+    let mut diagnostics =
+        GenerationDiagnostics::new(GenerationDiagnosticsMetadata::for_invocation(
+            mode,
+            result,
+            prompt_source,
+            output.diagnostics_stdout_mode(),
+            timeout_seconds,
+        ))
+        .with_runs(runs);
+
+    if let Some(batch_summary) = batch_summary {
+        diagnostics = diagnostics.with_batch_summary(batch_summary);
+    }
+
+    if let Some(failure) = failure {
+        diagnostics = diagnostics.with_failure(failure);
+    }
+
+    diagnostics
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum GenerateSuccessOutput {
+    Single(GenerationManifest),
+    Batch(BatchGenerationManifest),
+}
+
+#[derive(Debug)]
+struct BatchGenerationFailure {
+    error: CliError,
+    summary: BatchDiagnosticsSummary,
+}
+
+fn generate_single_prompt(
+    prompt: &str,
+    out: &Path,
+    timeout: std::time::Duration,
+    diagnostics: Option<CodexDiagnosticsRecorder>,
+) -> Result<GenerationManifest, CliError> {
+    let mut options = CodexGenerationOptions::new(timeout);
+    if let Some(diagnostics) = diagnostics {
+        options = options.with_diagnostics(diagnostics);
+    }
+
+    let generated = generate_image_with_codex_with_options(prompt, out, options)?;
+    let source =
+        GeneratedImageSource::trusted_after(generated.source_path, generated.source_not_before);
+
+    write_generation_output_from_sources(prompt, GPT_IMAGE_MODEL, out, &[source])
+}
+
+fn generate_prompt_batch(
+    prompt_file: &Path,
+    out: &Path,
+    timeout: std::time::Duration,
+    diagnostics: Option<&CodexDiagnosticsRecorder>,
+) -> Result<(BatchGenerationManifest, BatchDiagnosticsSummary), BatchGenerationFailure> {
+    let prompts =
+        read_prompt_file_prompts(prompt_file).map_err(|error| BatchGenerationFailure {
+            error,
+            summary: BatchDiagnosticsSummary {
+                planned_items: 0,
+                completed_items: 0,
+                failed_item_index: None,
+            },
+        })?;
+
+    let mut summary = BatchDiagnosticsSummary {
+        planned_items: prompts.len(),
+        completed_items: 0,
+        failed_item_index: None,
+    };
+
+    remove_batch_manifest_if_exists(out)
+        .map_err(|error| BatchGenerationFailure { error, summary })?;
+
+    let mut item_manifests = Vec::with_capacity(prompts.len());
+    for (index, prompt) in prompts.iter().enumerate() {
+        let item_index = index + 1;
+        let item_out_dir = out.join(format!("item-{item_index:04}"));
+        let item_diagnostics = diagnostics.map(|session| session.for_item(item_index));
+
+        match generate_single_prompt(prompt, &item_out_dir, timeout, item_diagnostics) {
+            Ok(item_manifest) => {
+                summary.completed_items += 1;
+                item_manifests.push(item_manifest);
+            }
+            Err(error) => {
+                summary.failed_item_index = Some(item_index);
+                return Err(BatchGenerationFailure { error, summary });
+            }
+        }
+    }
+
+    let manifest =
+        write_batch_generation_manifest(prompt_file, GPT_IMAGE_MODEL, out, &item_manifests)
+            .map_err(|error| BatchGenerationFailure { error, summary })?;
+
+    Ok((manifest, summary))
+}
+
+fn read_prompt_file_prompts(prompt_file: &Path) -> Result<Vec<String>, CliError> {
+    let raw = std::fs::read_to_string(prompt_file).map_err(|_| CliError::PromptFileReadFailed)?;
+    let prompts: Vec<String> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToOwned::to_owned)
+        .collect();
+
+    if prompts.is_empty() {
+        return Err(CliError::PromptFileEmpty);
+    }
+
+    Ok(prompts)
+}
+
+fn format_generate_result_human(result: &GenerateSuccessOutput, out_dir: &Path) -> String {
+    match result {
+        GenerateSuccessOutput::Single(manifest) => {
+            format_single_generate_result_human(manifest, out_dir)
+        }
+        GenerateSuccessOutput::Batch(manifest) => {
+            format_batch_generate_result_human(manifest, out_dir)
+        }
+    }
+}
+
+fn format_single_generate_result_human(manifest: &GenerationManifest, out_dir: &Path) -> String {
+    let image_count = manifest.images.len();
+    let mut lines = vec![
+        format!(
+            "codex-image generated {image_count} image artifact{}",
+            if image_count == 1 { "" } else { "s" }
+        ),
+        format!("model: {}", manifest.model),
+        format!("out: {}", out_dir.display()),
+        format!("manifest: {}", manifest.manifest_path),
+    ];
+
+    for image in &manifest.images {
+        lines.push(format!(
+            "image[{index}]: {path} ({byte_count} bytes, {format})",
+            index = image.index,
+            path = image.path,
+            byte_count = image.byte_count,
+            format = image.format,
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn format_batch_generate_result_human(
+    manifest: &BatchGenerationManifest,
+    out_dir: &Path,
+) -> String {
+    let mut lines = vec![
+        format!(
+            "codex-image generated {} batch item{}",
+            manifest.item_count,
+            if manifest.item_count == 1 { "" } else { "s" }
+        ),
+        format!("model: {}", manifest.model),
+        format!("out: {}", out_dir.display()),
+        format!("manifest: {}", manifest.manifest_path),
+    ];
+
+    for item in &manifest.items {
+        lines.push(format!(
+            "item[{index}]: {out_dir} ({image_count} image artifact{plural})",
+            index = item.index,
+            out_dir = item.out_dir,
+            image_count = item.images.len(),
+            plural = if item.images.len() == 1 { "" } else { "s" }
+        ));
+        lines.push(format!(
+            "item_manifest[{index}]: {manifest_path}",
+            index = item.index,
+            manifest_path = item.manifest_path,
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn update(
+    yes: bool,
+    dry_run: bool,
+    version: Option<String>,
+    output: OutputArgs,
+) -> Result<(), CliError> {
     let client = GitHubReleaseClient::new(UPDATE_REPOSITORY)?;
     let installer = FilesystemBinaryInstaller;
     let current_executable =
@@ -280,7 +684,7 @@ fn update(yes: bool, dry_run: bool, version: Option<String>) -> Result<(), CliEr
         version,
     )?;
 
-    print_update_result(&result)
+    print_update_result(&result, output)
 }
 
 pub fn execute_update_command<S: UpdateSource, I: BinaryInstaller>(
@@ -303,9 +707,29 @@ pub fn execute_update_command<S: UpdateSource, I: BinaryInstaller>(
     run_update_with_installer(source, &options, installer).map_err(Into::into)
 }
 
-fn print_update_result(result: &UpdateResult) -> Result<(), CliError> {
-    println!("{}", format_update_result(result));
+fn print_update_result(result: &UpdateResult, output: OutputArgs) -> Result<(), CliError> {
+    if let Some(line) = render_update_result(result, output)? {
+        println!("{line}");
+    }
+
     Ok(())
+}
+
+fn render_update_result(
+    result: &UpdateResult,
+    output: OutputArgs,
+) -> Result<Option<String>, CliError> {
+    if !output.should_emit_stdout() {
+        return Ok(None);
+    }
+
+    match output.effective_mode() {
+        OutputMode::Human => Ok(Some(format_update_result(result))),
+        OutputMode::Json => {
+            let line = serde_json::to_string(result).map_err(|_| CliError::OutputWriteFailed)?;
+            Ok(Some(line))
+        }
+    }
 }
 
 fn format_update_result(result: &UpdateResult) -> String {
@@ -335,6 +759,18 @@ fn format_update_result(result: &UpdateResult) -> String {
     }
 }
 
+fn parse_positive_timeout_secs(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| "timeout seconds must be a positive integer".to_string())?;
+
+    if parsed == 0 {
+        return Err("timeout seconds must be greater than 0".to_string());
+    }
+
+    Ok(parsed)
+}
+
 fn parse_release_tag(value: &str) -> Result<String, String> {
     if !value.starts_with('v') {
         return Err("version tag must start with 'v' (example: v1.2.3)".to_string());
@@ -358,13 +794,29 @@ fn dispatch_skill(command: SkillCommands) -> Result<(), CliError> {
             scope,
             yes,
             force,
-        } => skill_command(SkillCommandOperation::Install, &tool, &scope, yes, force),
+            output,
+        } => skill_command(
+            SkillCommandOperation::Install,
+            &tool,
+            &scope,
+            yes,
+            force,
+            output,
+        ),
         SkillCommands::Update {
             tool,
             scope,
             yes,
             force,
-        } => skill_command(SkillCommandOperation::Update, &tool, &scope, yes, force),
+            output,
+        } => skill_command(
+            SkillCommandOperation::Update,
+            &tool,
+            &scope,
+            yes,
+            force,
+            output,
+        ),
     }
 }
 
@@ -374,6 +826,7 @@ fn skill_command(
     scopes: &[ScopeArg],
     yes: bool,
     force: bool,
+    output: OutputArgs,
 ) -> Result<(), CliError> {
     let interactive_mode = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let selector = DialoguerTargetSelector;
@@ -383,17 +836,20 @@ fn skill_command(
         scopes,
         yes,
         force,
+        output,
         interactive_mode,
         &selector,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn skill_command_with_selector(
     operation: SkillCommandOperation,
     tools: &[ToolArg],
     scopes: &[ScopeArg],
     yes: bool,
     force: bool,
+    output: OutputArgs,
     interactive_mode: bool,
     selector: &dyn InstallTargetSelector,
 ) -> Result<(), CliError> {
@@ -404,6 +860,7 @@ fn skill_command_with_selector(
         scopes,
         yes,
         force,
+        output,
         interactive_mode,
         selector,
         &project_root,
@@ -429,6 +886,7 @@ fn install_skill_command_with_selector_and_project_root(
         scopes,
         yes,
         force,
+        OutputArgs::default(),
         interactive_mode,
         selector,
         project_root,
@@ -451,6 +909,12 @@ struct SkillActionOutput {
     target_path: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct SkillCommandOutput {
+    operation: &'static str,
+    results: Vec<SkillActionOutput>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum SkillAction {
     InstallOrUpdate(SkillInstallTarget),
@@ -464,6 +928,7 @@ fn skill_command_with_selector_and_project_root(
     scopes: &[ScopeArg],
     yes: bool,
     force: bool,
+    output: OutputArgs,
     interactive_mode: bool,
     selector: &dyn InstallTargetSelector,
     project_root: &Path,
@@ -525,7 +990,14 @@ fn skill_command_with_selector_and_project_root(
         TargetSelectionState::PartialTargets => unreachable!("partial targets already handled"),
     };
 
-    run_skill_action_loop(operation, plan, force, project_root, home_dir_override)
+    run_skill_action_loop(
+        operation,
+        plan,
+        force,
+        output,
+        project_root,
+        home_dir_override,
+    )
 }
 
 fn interactive_uninstall_targets(
@@ -574,6 +1046,7 @@ fn run_skill_action_loop(
     operation: SkillCommandOperation,
     plan: SkillCommandPlan,
     force: bool,
+    output: OutputArgs,
     project_root: &Path,
     home_dir_override: Option<&Path>,
 ) -> Result<(), CliError> {
@@ -639,12 +1112,60 @@ fn run_skill_action_loop(
         }
     }
 
-    for output in outputs {
-        let line = serde_json::to_string(&output).map_err(|_| CliError::Unknown)?;
+    if let Some(line) = render_skill_action_outputs(operation, outputs, output)? {
         println!("{line}");
     }
 
     Ok(())
+}
+
+fn render_skill_action_outputs(
+    operation: SkillCommandOperation,
+    outputs: Vec<SkillActionOutput>,
+    output: OutputArgs,
+) -> Result<Option<String>, CliError> {
+    if !output.should_emit_stdout() {
+        return Ok(None);
+    }
+
+    match output.effective_mode() {
+        OutputMode::Human => Ok(Some(format_skill_action_outputs(operation, &outputs))),
+        OutputMode::Json => {
+            let payload = SkillCommandOutput {
+                operation: operation.slug(),
+                results: outputs,
+            };
+            let line = serde_json::to_string(&payload).map_err(|_| CliError::OutputWriteFailed)?;
+            Ok(Some(line))
+        }
+    }
+}
+
+fn format_skill_action_outputs(
+    operation: SkillCommandOperation,
+    outputs: &[SkillActionOutput],
+) -> String {
+    let target_count = outputs.len();
+    let mut lines = vec![format!(
+        "codex-image skill {} completed {target_count} target{}",
+        operation.slug(),
+        if target_count == 1 { "" } else { "s" }
+    )];
+
+    for output in outputs {
+        lines.push(format!(
+            "{}: {} -> {}",
+            format_skill_target(output),
+            output.status.replace('_', " "),
+            output.target_path
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn format_skill_target(output: &SkillActionOutput) -> String {
+    format!("{}/{}", output.tool, output.scope)
 }
 
 fn resolve_home_dir(
@@ -684,8 +1205,8 @@ mod tests {
     use std::cell::RefCell;
 
     use super::{
-        format_update_result, install_skill_command_with_selector_and_project_root, ScopeArg,
-        ToolArg,
+        format_update_result, install_skill_command_with_selector_and_project_root,
+        render_update_result, OutputArgs, OutputMode, ScopeArg, ToolArg,
     };
     use crate::diagnostics::CliError;
     use crate::skill_install_ux::{
@@ -724,16 +1245,96 @@ mod tests {
         }
     }
 
-    #[test]
-    fn update_result_renderer_uses_human_text_for_success() {
-        let output = format_update_result(&UpdateResult {
+    fn fixture_updated_result() -> UpdateResult {
+        UpdateResult {
             status: "updated".to_string(),
             current_version: "0.1.0".to_string(),
             target_version: "v1.2.3".to_string(),
             target: "x86_64-unknown-linux-gnu".to_string(),
             asset: "codex-image-v1.2.3-x86_64-unknown-linux-gnu.tar.gz".to_string(),
             binary_path: "/tmp/codex-image".to_string(),
-        });
+        }
+    }
+
+    fn fixture_validated_result() -> UpdateResult {
+        UpdateResult {
+            status: "validated".to_string(),
+            current_version: "0.1.0".to_string(),
+            target_version: "v1.2.3".to_string(),
+            target: "x86_64-apple-darwin".to_string(),
+            asset: "codex-image-v1.2.3-x86_64-apple-darwin.tar.gz".to_string(),
+            binary_path: "/usr/local/bin/codex-image".to_string(),
+        }
+    }
+
+    #[test]
+    fn update_output_mode_defaults_to_human_text() {
+        let rendered = render_update_result(&fixture_updated_result(), OutputArgs::default())
+            .expect("human rendering should succeed")
+            .expect("default mode should emit stdout");
+
+        assert!(rendered.contains("codex-image updated from 0.1.0 to v1.2.3"));
+        assert!(rendered.contains("target: x86_64-unknown-linux-gnu"));
+        assert!(!rendered.trim_start().starts_with('{'));
+    }
+
+    #[test]
+    fn update_output_mode_json_serializes_single_update_result_object() {
+        let rendered = render_update_result(
+            &fixture_updated_result(),
+            OutputArgs {
+                output: OutputMode::Json,
+                quiet: false,
+            },
+        )
+        .expect("json rendering should succeed")
+        .expect("json mode should emit stdout");
+
+        assert_eq!(
+            rendered.lines().count(),
+            1,
+            "json output must be single-line"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&rendered).expect("rendered JSON should parse");
+        assert_eq!(json["status"], "updated");
+        assert_eq!(json["target_version"], "v1.2.3");
+        assert_eq!(json["target"], "x86_64-unknown-linux-gnu");
+    }
+
+    #[test]
+    fn update_output_mode_quiet_suppresses_validated_and_updated_stdout() {
+        let quiet_human = render_update_result(
+            &fixture_updated_result(),
+            OutputArgs {
+                output: OutputMode::Human,
+                quiet: true,
+            },
+        )
+        .expect("quiet human rendering should not error");
+        assert!(
+            quiet_human.is_none(),
+            "quiet should suppress updated stdout"
+        );
+
+        let quiet_json = render_update_result(
+            &fixture_validated_result(),
+            OutputArgs {
+                output: OutputMode::Json,
+                quiet: true,
+            },
+        )
+        .expect("quiet json rendering should not error");
+        assert!(
+            quiet_json.is_none(),
+            "quiet should suppress validated stdout"
+        );
+    }
+
+    #[test]
+    fn update_result_renderer_uses_human_text_for_success() {
+        let output = format_update_result(&fixture_updated_result());
 
         assert!(output.contains("codex-image updated from 0.1.0 to v1.2.3"));
         assert!(output.contains("target: x86_64-unknown-linux-gnu"));
@@ -744,14 +1345,7 @@ mod tests {
 
     #[test]
     fn update_result_renderer_uses_human_text_for_dry_run() {
-        let output = format_update_result(&UpdateResult {
-            status: "validated".to_string(),
-            current_version: "0.1.0".to_string(),
-            target_version: "v1.2.3".to_string(),
-            target: "x86_64-apple-darwin".to_string(),
-            asset: "codex-image-v1.2.3-x86_64-apple-darwin.tar.gz".to_string(),
-            binary_path: "/usr/local/bin/codex-image".to_string(),
-        });
+        let output = format_update_result(&fixture_validated_result());
 
         assert!(output.contains("codex-image update validated v1.2.3 for x86_64-apple-darwin"));
         assert!(output.contains("asset: codex-image-v1.2.3-x86_64-apple-darwin.tar.gz"));

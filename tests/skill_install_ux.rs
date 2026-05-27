@@ -217,18 +217,15 @@ fn skill_install_ux_interactive_options_mark_installed_states_and_defaults() {
         .join("skills")
         .join("codex-image")
         .join("SKILL.md");
-    std::fs::create_dir_all(claude_project_path.parent().expect("parent"))
-        .expect("create parent");
-    std::fs::write(&claude_project_path, "# manual custom skill\n")
-        .expect("seed manual protected");
+    std::fs::create_dir_all(claude_project_path.parent().expect("parent")).expect("create parent");
+    std::fs::write(&claude_project_path, "# manual custom skill\n").expect("seed manual protected");
 
     let options = interactive_target_options(home.path(), project.path());
 
     let claude_global = options
         .iter()
         .find(|option| {
-            option.target.tool == SupportedTool::Claude
-                && option.target.scope == SkillScope::Global
+            option.target.tool == SupportedTool::Claude && option.target.scope == SkillScope::Global
         })
         .expect("claude global option");
     assert_eq!(
@@ -241,8 +238,7 @@ fn skill_install_ux_interactive_options_mark_installed_states_and_defaults() {
     let codex_global = options
         .iter()
         .find(|option| {
-            option.target.tool == SupportedTool::Codex
-                && option.target.scope == SkillScope::Global
+            option.target.tool == SupportedTool::Codex && option.target.scope == SkillScope::Global
         })
         .expect("codex global option");
     assert_eq!(

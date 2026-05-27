@@ -84,7 +84,7 @@ PHASE="generate"
 log_phase "running Codex-backed generate prompt and capturing manifest JSON"
 generate_stdout="$(mktemp -t codex-image-uat-generate-out.XXXXXX)"
 generate_stderr="$(mktemp -t codex-image-uat-generate-err.XXXXXX)"
-if ! "$binary" generate "UAT smoke image from codex-image" --out "$out_dir" >"$generate_stdout" 2>"$generate_stderr"; then
+if ! "$binary" generate "UAT smoke image from codex-image" --out "$out_dir" --output json >"$generate_stdout" 2>"$generate_stderr"; then
   redact_cli_stderr "$generate_stderr"
   echo '[uat-live-smoke] ERROR phase=generate generate command failed' >&2
   exit 1

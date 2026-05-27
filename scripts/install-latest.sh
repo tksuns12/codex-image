@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
 set -eu
+set -f
 
 REPO="${CODEX_IMAGE_REPO:-tksuns12/codex-image}"
 INSTALL_DIR="${CODEX_IMAGE_INSTALL_DIR:-$HOME/.local/bin}"
@@ -12,12 +13,90 @@ need_command() {
   fi
 }
 
+select_checksum_verifier() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    HASH_TOOL="sha256sum"
+  elif command -v shasum >/dev/null 2>&1; then
+    HASH_TOOL="shasum"
+  else
+    echo "codex-image installer requires 'sha256sum' or 'shasum' on PATH to verify SHA256SUMS" >&2
+    exit 1
+  fi
+}
+
+is_sha256() {
+  case "${1:-}" in
+    ""|*[!0123456789abcdefABCDEF]*) return 1 ;;
+    *) [ "${#1}" -eq 64 ] ;;
+  esac
+}
+
+extract_expected_sha256() {
+  CHECKSUM_FILE="$1"
+  CHECKSUM_MATCHES=0
+  EXPECTED_SHA256=""
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ -z "$line" ]; then
+      continue
+    fi
+
+    checksum="$(printf '%s\n' "$line" | awk 'NF == 2 { print $1; exit 0 } { exit 1 }')" || {
+      echo "malformed SHA256SUMS entry for ${ASSET}" >&2
+      exit 1
+    }
+    filename="$(printf '%s\n' "$line" | awk 'NF == 2 { print $2; exit 0 } { exit 1 }')" || {
+      echo "malformed SHA256SUMS entry for ${ASSET}" >&2
+      exit 1
+    }
+    case "$filename" in
+      \*) filename="${filename#\*}" ;;
+    esac
+
+    if [ -z "$filename" ] || ! is_sha256 "$checksum"; then
+      echo "malformed SHA256SUMS entry for ${ASSET}" >&2
+      exit 1
+    fi
+
+    if [ "$filename" = "$ASSET" ]; then
+      CHECKSUM_MATCHES=$((CHECKSUM_MATCHES + 1))
+      EXPECTED_SHA256="$checksum"
+    fi
+  done < "$CHECKSUM_FILE"
+
+  if [ "$CHECKSUM_MATCHES" -eq 0 ]; then
+    echo "SHA256SUMS does not contain checksum for ${ASSET}" >&2
+    exit 1
+  fi
+
+  if [ "$CHECKSUM_MATCHES" -gt 1 ]; then
+    echo "SHA256SUMS contains duplicate checksum entries for ${ASSET}" >&2
+    exit 1
+  fi
+}
+
+verify_archive_checksum() {
+  (
+    cd "$TMPDIR"
+    if [ "$HASH_TOOL" = "sha256sum" ]; then
+      printf '%s  %s\n' "$EXPECTED_SHA256" "$ASSET" | sha256sum -c -
+    else
+      printf '%s  %s\n' "$EXPECTED_SHA256" "$ASSET" | shasum -a 256 -c -
+    fi
+  ) || {
+    echo "checksum mismatch for ${ASSET}" >&2
+    exit 1
+  }
+}
+
 need_command curl
 need_command sed
+need_command awk
 need_command tar
 need_command uname
 need_command mktemp
 need_command install
+select_checksum_verifier
 
 VERSION="$(
   curl -fsSL "$API_URL" |
@@ -49,7 +128,10 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+curl -fL "https://github.com/${REPO}/releases/download/${VERSION}/SHA256SUMS" -o "${TMPDIR}/SHA256SUMS"
 curl -fL "https://github.com/${REPO}/releases/download/${VERSION}/${ASSET}" -o "${TMPDIR}/${ASSET}"
+extract_expected_sha256 "${TMPDIR}/SHA256SUMS"
+verify_archive_checksum "${TMPDIR}/${ASSET}" "${TMPDIR}/SHA256SUMS"
 tar -xzf "${TMPDIR}/${ASSET}" -C "$TMPDIR"
 mkdir -p "$INSTALL_DIR"
 install -m 0755 "${TMPDIR}/${ARCHIVE_ROOT}/codex-image" "${INSTALL_DIR}/codex-image"

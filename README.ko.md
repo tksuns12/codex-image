@@ -29,7 +29,7 @@ Codex는 이미 로그인되어 있어야 하며, 내장 이미지 생성 도구
 
 ### 릴리스 아티팩트로 설치
 
-플랫폼에 맞는 설치 스크립트를 내려받아 실행하세요. 각 스크립트는 최신 GitHub Release 태그를 자동으로 확인하고, 맞는 아카이브를 내려받아 바이너리를 설치한 뒤 `codex-image --help`로 확인합니다.
+플랫폼에 맞는 설치 스크립트를 내려받아 실행하세요. 각 스크립트는 최신 GitHub Release 태그를 자동으로 확인하고, 다운로드한 아카이브를 `SHA256SUMS`로 검증한 뒤 바이너리를 설치하고 `codex-image --help`로 확인합니다.
 
 #### Linux x86_64 / macOS x86_64 / macOS arm64
 
@@ -67,29 +67,15 @@ codex-image generate "도서관에서 책을 읽는 수채화풍 여우" --out .
 이 단일 명령의 기대 결과:
 - `./out` 아래 `image-0001.<format>` 이름의 이미지 파일 생성
 - `./out` 아래 `manifest.json` 생성
-- 동일한 매니페스트 JSON이 stdout에 출력
+- 기본 동작으로 사람이 읽기 쉬운 성공 메시지가 stdout에 출력
 
-stdout 예시 형식:
+`manifest.json`은 항상 `--out` 디렉터리에 기록됩니다. 자동화에서 매니페스트를 stdout JSON으로 파싱해야 하면 `--output json`을 명시해 다시 실행하세요.
 
-```json
-{
-  "prompt": "도서관에서 책을 읽는 수채화풍 여우",
-  "model": "gpt-image-2",
-  "manifest_path": "./out/manifest.json",
-  "images": [
-    {
-      "index": 1,
-      "path": "./out/image-0001.png",
-      "format": "png",
-      "byte_count": 12345
-    }
-  ],
-  "response": {
-    "created": 1777523488,
-    "usage": {}
-  }
-}
+```bash
+codex-image generate "도서관에서 책을 읽는 수채화풍 여우" --out ./out --output json
 ```
+
+호출자가 파일 결과와 종료 코드만 확인하면 충분한 경우 `--quiet`로 성공 stdout 메시지를 숨길 수 있습니다.
 
 ## 첫 실행 후
 
@@ -109,13 +95,15 @@ quickstart 이후 작업이 필요하면 아래를 사용하세요.
 빠른 명령 참고:
 
 ```bash
+codex-image generate "도서관에서 책을 읽는 수채화풍 여우" --out ./out --quiet
+codex-image generate --prompt-file ./prompt.txt --out ./out --timeout 120 --debug-diagnostics
 codex-image skill install --tool codex --scope project --yes
 codex-image skill update --tool codex --scope project --yes
-codex-image update --dry-run
+codex-image update --dry-run --output json
 codex-image update
 codex-image update --version v1.2.3
 ```
 
-자동화에서는 스킬 명령에 `--tool`, `--scope`를 명시하고, 실제 교체 전에는 `codex-image update --dry-run`으로 비변경 미리보기를 권장합니다.
+자동화에서는 스킬 명령에 `--tool`, `--scope`를 명시하세요. 머신이 stdout을 파싱할 때는 `--output json`을 사용하고, 실제 교체 전에는 `codex-image update --dry-run --output json`으로 비변경 JSON 미리보기를 확인하세요.
 
 상세 운영 절차(스킬 상호작용 설치, 보호 대상 처리, no-live/라이브 검증 등)는 [docs/advanced-reference.md](docs/advanced-reference.md)를 기준 문서로 사용하세요.

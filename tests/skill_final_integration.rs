@@ -15,29 +15,28 @@ struct ExpectedTarget {
     path: PathBuf,
 }
 
-fn parse_json_lines(bytes: &[u8]) -> Vec<Value> {
+fn parse_json_object(bytes: &[u8]) -> Value {
     let text = String::from_utf8(bytes.to_vec()).expect("stdout should be utf-8");
     let trimmed = text.trim_end();
     assert!(!trimmed.is_empty(), "stdout must not be empty");
-
-    trimmed
-        .lines()
-        .enumerate()
-        .map(|(index, line)| {
-            serde_json::from_str::<Value>(line).unwrap_or_else(|error| {
-                panic!(
-                    "line {} should be valid JSON: {line:?} ({error})",
-                    index + 1
-                )
-            })
-        })
-        .collect()
+    assert_eq!(trimmed.lines().count(), 1, "stdout must be one JSON object");
+    serde_json::from_str::<Value>(trimmed).expect("stdout should be valid JSON")
 }
 
 fn parse_single_json_line(bytes: &[u8]) -> Value {
-    let lines = parse_json_lines(bytes);
-    assert_eq!(lines.len(), 1, "expected exactly one JSON line");
-    lines.into_iter().next().expect("one JSON line must exist")
+    parse_json_object(bytes)
+}
+
+fn results(value: &Value) -> &[Value] {
+    value["results"]
+        .as_array()
+        .expect("payload should contain results array")
+}
+
+fn single_result(value: &Value) -> &Value {
+    let results = results(value);
+    assert_eq!(results.len(), 1, "payload should contain one result");
+    &results[0]
 }
 
 fn expected_targets(home_dir: &Path, project_root: &Path) -> Vec<ExpectedTarget> {
@@ -97,6 +96,8 @@ fn run_skill_command(
         .arg("--scope")
         .arg("project")
         .arg("--yes")
+        .arg("--output")
+        .arg("json")
         .env("HOME", home_dir);
 
     cmd.output().expect("command should run")
@@ -119,6 +120,8 @@ fn run_single_target_skill_command(
         .arg("--scope")
         .arg(scope)
         .arg("--yes")
+        .arg("--output")
+        .arg("json")
         .env("HOME", home_dir);
 
     if force {
@@ -137,7 +140,7 @@ fn assert_skill_outputs(
     assert_eq!(
         outputs.len(),
         expected.len(),
-        "expected {} JSON lines, got {}",
+        "expected {} results, got {}",
         expected.len(),
         outputs.len()
     );
@@ -213,10 +216,11 @@ fn skill_final_integration_cli_installs_openai_aligned_managed_skill_for_all_sup
         String::from_utf8_lossy(&install_output.stderr)
     );
 
-    let install_lines = parse_json_lines(&install_output.stdout);
+    let install_payload = parse_json_object(&install_output.stdout);
+    assert_eq!(install_payload["operation"], "install");
     let install_expected_statuses = expected_install_statuses(&expected);
     assert_skill_outputs(
-        &install_lines,
+        results(&install_payload),
         &expected,
         &install_expected_statuses,
         &managed_content,
@@ -246,10 +250,11 @@ fn skill_final_integration_cli_installs_openai_aligned_managed_skill_for_all_sup
         String::from_utf8_lossy(&update_output.stderr)
     );
 
-    let update_lines = parse_json_lines(&update_output.stdout);
+    let update_payload = parse_json_object(&update_output.stdout);
+    assert_eq!(update_payload["operation"], "update");
     let update_expected_statuses = expected_unchanged_statuses(&expected);
     assert_skill_outputs(
-        &update_lines,
+        results(&update_payload),
         &expected,
         &update_expected_statuses,
         &managed_content,
@@ -333,11 +338,13 @@ fn skill_final_integration_update_blocks_manual_edit_redacts_stderr_and_force_ov
     assert!(forced_output.stderr.is_empty());
 
     let forced_json = parse_single_json_line(&forced_output.stdout);
-    assert_eq!(forced_json["tool"], "pi");
-    assert_eq!(forced_json["scope"], "project");
-    assert_eq!(forced_json["status"], "forced_overwrite");
+    assert_eq!(forced_json["operation"], "update");
+    let forced_result = single_result(&forced_json);
+    assert_eq!(forced_result["tool"], "pi");
+    assert_eq!(forced_result["scope"], "project");
+    assert_eq!(forced_result["status"], "forced_overwrite");
     assert_eq!(
-        forced_json["target_path"].as_str(),
+        forced_result["target_path"].as_str(),
         Some(target.to_string_lossy().as_ref())
     );
 
@@ -413,11 +420,13 @@ fn skill_final_integration_install_blocks_tampered_marker_by_default_and_force_o
     assert!(forced_output.stderr.is_empty());
 
     let forced_json = parse_single_json_line(&forced_output.stdout);
-    assert_eq!(forced_json["tool"], "codex");
-    assert_eq!(forced_json["scope"], "project");
-    assert_eq!(forced_json["status"], "forced_overwrite");
+    assert_eq!(forced_json["operation"], "install");
+    let forced_result = single_result(&forced_json);
+    assert_eq!(forced_result["tool"], "codex");
+    assert_eq!(forced_result["scope"], "project");
+    assert_eq!(forced_result["status"], "forced_overwrite");
     assert_eq!(
-        forced_json["target_path"].as_str(),
+        forced_result["target_path"].as_str(),
         Some(target.to_string_lossy().as_ref())
     );
 

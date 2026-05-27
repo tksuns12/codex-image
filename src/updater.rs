@@ -1,10 +1,12 @@
 use std::env::consts;
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{copy, Cursor, Read};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveKind {
@@ -81,6 +83,8 @@ pub struct ResolvedArtifact {
     pub platform_target: String,
     pub asset_name: String,
     pub download_url: String,
+    pub checksum_asset_name: String,
+    pub checksum_download_url: String,
     pub archive_kind: ArchiveKind,
     pub binary_name: String,
 }
@@ -177,6 +181,8 @@ impl BinaryInstaller for FilesystemBinaryInstaller {
         Ok(())
     }
 }
+
+pub const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS";
 
 const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
 const DEFAULT_GITHUB_CONNECT_TIMEOUT_SECS: u64 = 5;
@@ -329,6 +335,18 @@ pub enum UpdateError {
     MissingReleaseAsset,
     #[error("duplicate release asset for platform")]
     DuplicateReleaseAsset,
+    #[error("missing SHA256SUMS release asset")]
+    MissingChecksumAsset,
+    #[error("duplicate SHA256SUMS release asset")]
+    DuplicateChecksumAsset,
+    #[error("SHA256SUMS metadata is invalid")]
+    ChecksumMetadataInvalid,
+    #[error("SHA256SUMS is missing the selected archive entry")]
+    ChecksumEntryMissing,
+    #[error("SHA256SUMS contains duplicate selected archive entries")]
+    ChecksumEntryDuplicate,
+    #[error("downloaded archive checksum does not match SHA256SUMS")]
+    ChecksumMismatch,
     #[error("asset download failed")]
     AssetDownloadFailed,
     #[error("archive payload is invalid")]
@@ -434,24 +452,48 @@ pub fn resolve_artifact(
 ) -> Result<ResolvedArtifact, UpdateError> {
     let expected = release_asset_name_for_tag(&metadata.tag_name, platform);
 
-    let mut matches = metadata
-        .assets
-        .iter()
-        .filter(|asset| asset.name == expected);
-    let first = matches.next().ok_or(UpdateError::MissingReleaseAsset)?;
-
-    if matches.next().is_some() {
-        return Err(UpdateError::DuplicateReleaseAsset);
-    }
+    let artifact = resolve_unique_asset(
+        metadata,
+        &expected,
+        UpdateError::MissingReleaseAsset,
+        UpdateError::DuplicateReleaseAsset,
+    )?;
+    let checksum_asset = resolve_unique_asset(
+        metadata,
+        CHECKSUMS_ASSET_NAME,
+        UpdateError::MissingChecksumAsset,
+        UpdateError::DuplicateChecksumAsset,
+    )?;
 
     Ok(ResolvedArtifact {
         version: metadata.tag_name.clone(),
         platform_target: platform.rust_target.to_string(),
-        asset_name: first.name.clone(),
-        download_url: first.download_url.clone(),
+        asset_name: artifact.name.clone(),
+        download_url: artifact.download_url.clone(),
+        checksum_asset_name: checksum_asset.name.clone(),
+        checksum_download_url: checksum_asset.download_url.clone(),
         archive_kind: platform.archive_kind,
         binary_name: platform.binary_name.to_string(),
     })
+}
+
+fn resolve_unique_asset<'a>(
+    metadata: &'a ReleaseMetadata,
+    expected_name: &str,
+    missing: UpdateError,
+    duplicate: UpdateError,
+) -> Result<&'a ReleaseAsset, UpdateError> {
+    let mut matches = metadata
+        .assets
+        .iter()
+        .filter(|asset| asset.name == expected_name);
+    let first = matches.next().ok_or(missing)?;
+
+    if matches.next().is_some() {
+        return Err(duplicate);
+    }
+
+    Ok(first)
 }
 
 pub fn run_update<S: UpdateSource>(
@@ -478,9 +520,15 @@ pub fn run_update_with_installer<S: UpdateSource, I: BinaryInstaller>(
     fs::create_dir_all(&temp_dir).map_err(|_| UpdateError::AssetDownloadFailed)?;
 
     let archive_path = temp_dir.join(&artifact.asset_name);
+    let checksum_path = temp_dir.join(&artifact.checksum_asset_name);
     source.download_asset_to_path(&artifact.download_url, &archive_path)?;
+    source.download_asset_to_path(&artifact.checksum_download_url, &checksum_path)?;
 
     let archive_bytes = fs::read(&archive_path).map_err(|_| UpdateError::AssetDownloadFailed)?;
+    let checksums =
+        fs::read_to_string(&checksum_path).map_err(|_| UpdateError::ChecksumMetadataInvalid)?;
+    verify_archive_checksum(&checksums, &artifact.asset_name, &archive_bytes)?;
+
     let expected_root = expected_archive_root(&artifact)?;
     let validated = validate_archive_bytes(
         artifact.archive_kind,
@@ -502,6 +550,76 @@ pub fn run_update_with_installer<S: UpdateSource, I: BinaryInstaller>(
     installer.replace_binary(&options.current_executable, &extracted_binary)?;
 
     Ok(update_result(options, &artifact, "updated"))
+}
+
+pub fn verify_archive_checksum(
+    checksums: &str,
+    asset_name: &str,
+    archive_bytes: &[u8],
+) -> Result<(), UpdateError> {
+    let expected = selected_archive_checksum(checksums, asset_name)?;
+    let actual = sha256_hex(archive_bytes);
+
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(UpdateError::ChecksumMismatch)
+    }
+}
+
+pub fn selected_archive_checksum(checksums: &str, asset_name: &str) -> Result<String, UpdateError> {
+    if checksums.trim().is_empty() {
+        return Err(UpdateError::ChecksumMetadataInvalid);
+    }
+
+    let mut selected: Option<String> = None;
+
+    for raw_line in checksums.lines() {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        let (digest, name) = parse_checksum_line(line)?;
+
+        if name == asset_name {
+            if selected.is_some() {
+                return Err(UpdateError::ChecksumEntryDuplicate);
+            }
+            selected = Some(digest.to_ascii_lowercase());
+        }
+    }
+
+    selected.ok_or(UpdateError::ChecksumEntryMissing)
+}
+
+fn parse_checksum_line(line: &str) -> Result<(&str, &str), UpdateError> {
+    if line.is_empty() {
+        return Err(UpdateError::ChecksumMetadataInvalid);
+    }
+
+    let split_at = line
+        .find(char::is_whitespace)
+        .ok_or(UpdateError::ChecksumMetadataInvalid)?;
+    let (digest, remainder) = line.split_at(split_at);
+
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(UpdateError::ChecksumMetadataInvalid);
+    }
+
+    let remainder = remainder.trim_start_matches(char::is_whitespace);
+    let name = remainder.strip_prefix('*').unwrap_or(remainder);
+
+    if name.is_empty() || name.chars().any(char::is_whitespace) {
+        return Err(UpdateError::ChecksumMetadataInvalid);
+    }
+
+    Ok((digest, name))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
 }
 
 fn expected_archive_root(artifact: &ResolvedArtifact) -> Result<String, UpdateError> {

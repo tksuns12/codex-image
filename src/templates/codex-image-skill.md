@@ -9,9 +9,10 @@ Use this skill when you need a reproducible image-generation workflow through th
 
 ## Command guidance
 
-- `codex-image generate "<prompt>" --out <dir>`
-- `codex-image skill install --tool <claude|claude-code|codex|pi|opencode> --scope <global|project> --yes`
-- `codex-image skill update --tool <claude|claude-code|codex|pi|opencode> --scope <global|project> --yes`
+- `codex-image generate "<prompt>" --out <dir> --output json`
+- `codex-image generate "<prompt>" --out <dir> --quiet`
+- `codex-image generate --prompt-file ./prompts.txt --out <dir> --output json --timeout 120`
+- `codex-image generate --prompt-file ./prompts.txt --out <dir> --output json --debug-diagnostics ./diagnostics.json`
 
 ## Supported tools
 
@@ -67,4 +68,13 @@ Use this skill when you need a reproducible image-generation workflow through th
 - Keep prompts explicit about subject, composition, framing, viewpoint, lighting, and style.
 - Keep outputs in project-controlled directories.
 - Keep generated files under the requested `--out` directory.
+- `--prompt-file` reads one prompt per line; blank lines and lines beginning with `#` are skipped.
+- Batch items are written under `item-0001/`, `item-0002/`, and so on.
+- The root `manifest.json` is written only after every item succeeds.
+- `--output json` success output and each `manifest.json` embed the raw prompt text per item; treat JSON stdout and manifests as sensitive output.
+- Prefer `--quiet` over `--output json` when prompts must not reach captured stdout or logs.
+- `--timeout <secs>` is a positive local codex subprocess timeout.
+- When `--quiet` is used, rely on generated files and exit status.
+- `--debug-diagnostics <file>` writes a local diagnostics sidecar.
+- Diagnostics are sanitized/redacted and not a raw codex transcript.
 - Avoid adding secrets or credentials to prompts or generated artifacts.
