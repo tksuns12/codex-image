@@ -211,6 +211,7 @@ impl CodexRunDiagnostics {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn failure(
         index: usize,
         item_index: Option<usize>,

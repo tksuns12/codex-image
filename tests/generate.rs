@@ -1799,11 +1799,11 @@ fn generate_timeout_is_local_only_and_not_forwarded_to_codex_subprocess() {
     let argv = fs::read_to_string(&argv_log).unwrap();
     let argv_tokens: Vec<&str> = argv.lines().collect();
     assert!(
-        !argv_tokens.iter().any(|arg| *arg == "--timeout"),
+        !argv_tokens.contains(&"--timeout"),
         "timeout flag must not be forwarded to Codex subprocess"
     );
     assert!(
-        !argv_tokens.iter().any(|arg| *arg == "7"),
+        !argv_tokens.contains(&"7"),
         "timeout value must not be forwarded to Codex subprocess"
     );
 }
@@ -1896,11 +1896,11 @@ fn generate_batch_success_from_prompt_file_writes_item_outputs_and_root_json_con
     assert_eq!(argv.matches("CALL ").count(), 2, "Codex should run twice");
     let argv_tokens: Vec<&str> = argv.lines().collect();
     assert!(
-        !argv_tokens.iter().any(|arg| *arg == "--timeout"),
+        !argv_tokens.contains(&"--timeout"),
         "timeout flag must not be forwarded to Codex subprocess"
     );
     assert!(
-        !argv_tokens.iter().any(|arg| *arg == "7"),
+        !argv_tokens.contains(&"7"),
         "timeout value must not be forwarded to Codex subprocess"
     );
 }
