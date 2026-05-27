@@ -13,7 +13,7 @@ fn release_workflow_is_scoped_to_release_branch_and_release_please() {
         "release workflow must publish only from pushes to release"
     );
     assert!(
-        workflow.contains("googleapis/release-please-action@v4"),
+        workflow.contains("googleapis/release-please-action@v5"),
         "release workflow must delegate semver/release PRs to release-please"
     );
     assert!(
@@ -36,7 +36,7 @@ fn release_workflow_is_scoped_to_release_branch_and_release_please() {
     );
     assert!(
         !workflow.contains("package-name:"),
-        "release-please-action v4 no longer accepts package-name input"
+        "release-please-action v4+ no longer accepts package-name input"
     );
     assert!(
         include_str!("../CHANGELOG.md").contains("release-please"),
@@ -105,11 +105,11 @@ fn release_workflow_publishes_aggregate_sha256sums() {
     let workflow = include_str!("../.github/workflows/release.yml");
 
     assert!(
-        workflow.contains("actions/upload-artifact@v4"),
+        workflow.contains("actions/upload-artifact@v7"),
         "matrix builds must upload archives as workflow artifacts for aggregation"
     );
     assert!(
-        workflow.contains("actions/download-artifact@v4"),
+        workflow.contains("actions/download-artifact@v8"),
         "publish job must download all matrix artifacts before checksumming"
     );
     assert!(
